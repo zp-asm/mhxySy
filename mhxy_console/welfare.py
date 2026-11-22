@@ -74,7 +74,7 @@ def open_welfare(eyes: Eyes, act: bool) -> bool:
     return True
 
 
-LEVEL_BADGE_ROI = (840, 40, 90, 60)   # 头像左下角「红框等级角标」（960x540 基准，实测 OCR 1.00）
+LEVEL_BADGE_ROI = (836, 38, 98, 64)   # 头像左下角「红框等级角标」（960x540 基准，实测 OCR 1.00）
 LEVEL_ROI = (246, 56, 120, 40)        # 兜底：人物属性面板上的「N级」
 
 
@@ -96,7 +96,9 @@ def read_level_badge(eyes: Eyes) -> int | None:
     for _box, txt, score in out[0]:
         digits = "".join(ch for ch in txt if ch.isdigit())
         if digits and float(score) > 0.5:
-            return int(digits)
+            lv = int(digits)
+            if 1 <= lv <= 175:      # 合理区间，挡掉把血条数字读成等级
+                return lv
     return None
 
 
