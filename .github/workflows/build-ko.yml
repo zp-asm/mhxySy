@@ -15,6 +15,8 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    permissions:
+      contents: write        # 建 Release 用（便于匿名下载产物）
     steps:
       - uses: actions/checkout@v4
 
@@ -62,3 +64,14 @@ jobs:
             drv/mhxy_drv.ko
             drv/kread
           if-no-files-found: error
+
+      - name: 发 Release（产物可直接匿名下载）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest drv/mhxy_drv.ko drv/kread \
+            --title "latest ($(date -u +%Y%m%d-%H%M))" \
+            --notes "auto build: mhxy_drv.ko + kread" \
+            --latest
+
