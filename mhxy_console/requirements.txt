@@ -1,0 +1,16 @@
+# 中控台依赖（Windows 宿主）
+# 已装：numpy opencv-python pyelftools
+# 必装（P0）
+dxcam>=0.0.5            # 宿主窗口 DXGI 抓帧（60fps 级）
+mss>=9.0                # dxcam 不可用时的兜底抓屏
+pywin32>=306            # 向 MuMu render_wnd 注入鼠标事件（走 nemuinput → 真实 uinput）
+adbutils>=2.6           # 多实例 adb 并发/重连
+rapidocr-onnxruntime>=1.3  # 游戏内文字识别
+
+# 可选（P1/P2）
+# frida>=17.26.3        # 需同时装 frida-server(android-x86_64) 同版本
+# objection>=1.11
+# uiautomator2>=3.0
+# lief>=0.15
+# androguard>=4.0
+# mitmproxy>=10

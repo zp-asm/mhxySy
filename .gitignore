@@ -1,0 +1,43 @@
+# ===== 大文件 / 取证副本：绝对不提交 =====
+artifacts/
+analysis/
+frames/
+templates/
+*.apk
+*.so
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.dex
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 编译产物 =====
+drv/*.ko
+drv/*.o
+drv/*.mod
+drv/*.mod.c
+drv/*.symvers
+drv/.tmp_versions/
+drv/Module.symvers
+drv/modules.order
+drv/*.order
+drv/.cache.mk
+drv/*.cmd
+
+# ===== 系统 / 编辑器 =====
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.log

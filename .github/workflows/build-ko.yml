@@ -1,0 +1,52 @@
+name: build-ko
+
+# 云端编 mhxy_drv.ko：不需要本机 Linux / 不需要 VT-x / 不装任何软件
+# 触发：Actions 页面点 "Run workflow"，或 push 到 drv/**
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'drv/**'
+      - '.github/workflows/build-ko.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc flex bison libelf-dev libssl-dev xz-utils wget
+
+      - name: 下载内核源码并 modules_prepare
+        run: |
+          cd "$RUNNER_TEMP"
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz
+          tar xf linux-6.1.90.tar.xz
+          cd linux-6.1.90
+          make ARCH=x86_64 defconfig >/dev/null
+          # 只用 gcc，避免 clang/llvm 工具链版本差异；模块 ABI 与编译器无关
+          make ARCH=x86_64 modules_prepare >/dev/null
+          echo "KDIR=$PWD" >> "$GITHUB_ENV"
+
+      - name: 编译模块
+        run: |
+          cd drv
+          # KBUILD_MODPOST_WARN=1：没有 Module.symvers 时把 "no symbol version" 降级为警告
+          make -j"$(nproc)" KDIR="$KDIR" ARCH=x86_64 KBUILD_MODPOST_WARN=1
+
+      - name: 产物检查
+        run: |
+          ls -l drv/*.ko
+          file drv/mhxy_drv.ko
+          modinfo drv/mhxy_drv.ko || true
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mhxy_drv-ko
+          path: drv/mhxy_drv.ko
+          if-no-files-found: error
