@@ -136,15 +136,27 @@ class Sense:
         return self.hits[name].score if name in self.hits else 0.0
 
     @property
+    def dark_ratio(self) -> float:
+        """非黑像素占比：过场/加载 <30%，正常场景 >90%。"""
+        return float((self.base.max(axis=2) > 8).mean())
+
+    @property
+    def is_dark(self) -> bool:
+        return self.dark_ratio < 0.35
+
+    @property
     def state(self) -> str:
         # 过场优先：黑屏字幕的状态下别的锚点都会失效
         if self.has("popup_use") or self.has("popup_close"):
             return "POPUP"
         if self.has("hero_close") or self.has("hero_close2"):
             return "HERO_PANEL"
-        if self.has("cut_ff") or self.has("cut_ff2"):
+        # 过场必须"暗"：右上角 ▶▶ 模板在主界面头像区也会误命中，光靠模板会把主界面当过场，
+        # 一按就按到头像 → 打开人物属性（实测踩过 17 次循环）。
+        if self.is_dark and (self.has("cut_ff") or self.has("cut_ff2") or self.has("cut_manual")):
             return "CUTSCENE"
-        if self.has("dlg_auto") or (self.has("dlg_speaker") and self.has("dlg_ff")):
+        # 真对话必须有说话人铭牌；主界面右下也有「自动」按钮，光看它会误判
+        if self.has("dlg_speaker"):
             return "DIALOG"
         # 面板优先：面板打开时右侧按钮全被遮住，主界面锚点不可信
         if any(k in self.hits for k in ("panel_close", "panel_close2", "panel_header")):

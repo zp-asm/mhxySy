@@ -41,6 +41,8 @@ class Pilot:
         self.cand_count = 0
         self.last_change = time.time()
         self.stats = {"popup": 0, "cut": 0, "dialog": 0, "panel": 0, "teleport": 0}
+        self.level = None
+        self.last_report = 0.0
 
     def ready(self, key: str, gap: float) -> bool:
         now = time.time()
@@ -59,6 +61,31 @@ class Pilot:
         log(f"{tag}: tap {name} ({cx},{cy}){'' if self.act else '  [dry]'}")
         return True
 
+    def report(self, s) -> None:
+        """每 30 秒报一次等级/任务，便于观察进展。"""
+        import time as _t
+        if _t.time() - self.last_report < 30:
+            return
+        self.last_report = _t.time()
+        try:
+            from mhxy_console.welfare import read_level_badge
+            lv = read_level_badge(self.eyes)
+        except Exception:
+            lv = None
+        if lv is not None and lv != self.level:
+            log(f"LV 变化 {self.level} -> {lv}")
+            self.level = lv
+        try:
+            from mhxy_console.quest import find_text
+            t = find_text(s, "主线", region=(730, 120, 230, 100))
+            if t:
+                import cv2
+                crop = s.base[t[2][1]:t[2][1] + t[2][3], t[2][0]:t[2][0] + t[2][2]]
+                log(f"主线追踪 OCR: {t[2]}")
+        except Exception:
+            pass
+        log(f"进度 Lv={self.level} state={s.state} stats={self.stats}")
+
     def tick(self) -> str:
         s = self.eyes.tick()
         raw = s.state
@@ -68,6 +95,7 @@ class Pilot:
         else:
             self.cand_state, self.cand_count = raw, 1
         st = raw if self.cand_count >= 2 else self.last_state
+        self.report(s)
         if st != self.last_state:
             log(f"state {self.last_state or '-'} -> {st}")
             self.last_state = st
@@ -75,8 +103,9 @@ class Pilot:
 
         # ---- HERO_PANEL：只关，不开（曾经因为"读等级"去点头像导致关了又开）
         if st == "HERO_PANEL":
-            if self.tap_hit(s, "hero_close", "hero-close", 3.0):
-                pass
+            for k in ("hero_close2", "hero_close"):
+                if self.tap_hit(s, k, "hero-close", 3.0):
+                    break
             return st
 
         # ---- POPUP
@@ -97,6 +126,17 @@ class Pilot:
 
         # ---- DIALOG
         if st == "DIALOG":
+            # 没有「自动」按钮时，走对话选项
+            if "dlg_auto" not in s.hits and self.ready("dialog-opt", 2.0):
+                from mhxy_console.quest import find_text
+                for word in ("对话", "继续", "确定", "接受", "提交"):
+                    t = find_text(s, word, region=(120, 300, 760, 210))
+                    if t:
+                        if self.act:
+                            adb_tap(t[0], t[1])
+                        log(f"dialog: 点选项「{word}」({t[0]},{t[1]}){'' if self.act else '  [dry]'}")
+                        self.stats["dialog"] += 1
+                        return st
             # 自动只点一次；之后靠游戏自己推进
             if "dlg_auto" in s.hits and self.ready("dialog-auto", 8.0):
                 cx, cy = s.hits["dlg_auto"].center
