@@ -1,10 +1,8 @@
 name: build-ko
 
-# 云端编两样东西，本机不装任何软件：
-#   1) mhxy_drv.ko   内核模块（x86_64）
-#   2) kread         静态 Android x86_64 客户端（设备上没有 python，必须给二进制）
-#
-# 失败时也会把构建日志发布成公开 Release（tag=ci-log），便于不带凭据排查。
+# 关键：用目标机自己的 /proc/config.gz（drv/kernel.config）编，而不是 vanilla defconfig。
+# 原因：struct module 的布局随 config 变化；用 defconfig 编出来的模块能 finit_module 成功，
+#       但内核按错误偏移读 init 指针 → "加载成功但什么都没做"（/proc/misc 无设备号、无 printk）。
 on:
   workflow_dispatch:
   push:
@@ -27,14 +25,20 @@ jobs:
           sudo apt-get install -y -qq build-essential bc flex bison libelf-dev libssl-dev \
             xz-utils wget unzip dwarves || true
 
-      - name: 内核源码 + modules_prepare
+      - name: 内核源码（使用目标机 config）
         run: |
+          set -o pipefail
           cd "$RUNNER_TEMP"
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz
           tar xf linux-6.1.90.tar.xz
           cd linux-6.1.90
-          make ARCH=x86_64 defconfig >/dev/null 2>&1
-          make ARCH=x86_64 modules_prepare 2>&1 | tail -20
+          cp "$GITHUB_WORKSPACE/drv/kernel.config" .config
+          # 关掉需要特殊工具链的选项，其余保持与目标机一致
+          ./scripts/config --file .config \
+            -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL \
+            -d CFI_CLANG -d RANDSTRUCT -d GCC_PLUGINS -d DEBUG_INFO_BTF || true
+          make ARCH=x86_64 olddefconfig 2>&1 | tail -5
+          make ARCH=x86_64 modules_prepare 2>&1 | tail -15
           echo "KDIR=$PWD" >> "$GITHUB_ENV"
 
       - name: 编内核模块
@@ -43,9 +47,11 @@ jobs:
         run: |
           set -o pipefail
           cd drv
-          make -j"$(nproc)" KDIR="$KDIR" ARCH=x86_64 KBUILD_MODPOST_WARN=1 2>&1 \
+          make -j"$(nproc)" KDIR="$KDIR" ARCH=x86_64 KCFLAGS=-Wno-error KBUILD_MODPOST_WARN=1 2>&1 \
             | tee "$RUNNER_TEMP/build-ko.log"
           ls -l mhxy_drv.ko
+          # 把模块的 vermagic 打出来对照
+          strings mhxy_drv.ko | grep -m1 vermagic || true
 
       - name: 编静态客户端（NDK r27c）
         id: cli
@@ -57,7 +63,8 @@ jobs:
           wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
           unzip -q android-ndk-r27c-linux.zip
           CC="$PWD/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang"
-          "$CC" -static -O2 -s -o "$GITHUB_WORKSPACE/drv/kread" "$GITHUB_WORKSPACE/drv/kread.c" 2>&1 | tee "$RUNNER_TEMP/build-cli.log"
+          "$CC" -static -O2 -s -o "$GITHUB_WORKSPACE/drv/kread" "$GITHUB_WORKSPACE/drv/kread.c" 2>&1 \
+            | tee "$RUNNER_TEMP/build-cli.log"
           file "$GITHUB_WORKSPACE/drv/kread"
 
       - name: 结果汇总
@@ -67,15 +74,15 @@ jobs:
             echo "ko step   = ${{ steps.ko.outcome }}"
             echo "cli step  = ${{ steps.cli.outcome }}"
             echo
-            echo "===== build-ko.log (tail 120) ====="
-            tail -120 "$RUNNER_TEMP/build-ko.log" 2>/dev/null || echo "(no ko log)"
+            echo "===== vermagic of built .ko ====="
+            strings drv/mhxy_drv.ko 2>/dev/null | grep -m2 vermagic || echo "(n/a)"
             echo
-            echo "===== build-cli.log (tail 60) ====="
-            tail -60 "$RUNNER_TEMP/build-cli.log" 2>/dev/null || echo "(no cli log)"
+            echo "===== build-ko.log (tail 100) ====="
+            tail -100 "$RUNNER_TEMP/build-ko.log" 2>/dev/null || echo "(no ko log)"
           } > "$RUNNER_TEMP/report.txt"
           cat "$RUNNER_TEMP/report.txt"
 
-      - name: 发布日志（公开可下载，便于排查）
+      - name: 发布日志
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -86,13 +93,11 @@ jobs:
             --title "ci-log $(date -u +%F_%H%M)" \
             --notes "build=${{ steps.ko.outcome }} client=${{ steps.cli.outcome }}" || true
 
-      - name: 发布产物（仅在成功时）
+      - name: 发布产物
         if: steps.ko.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ls -l drv/mhxy_drv.ko drv/kread 2>/dev/null || true
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
           gh release create latest drv/mhxy_drv.ko drv/kread \
-            --title "latest $(date -u +%F_%H%M)" \
-            --notes "auto build" --latest
+            --title "latest $(date -u +%F_%H%M)" --notes "auto build" --latest
