@@ -1,23 +1,17 @@
-"""单一职责 worker 集 —— 一个线程只做一件事。
+"""6 个职责域 worker（不是按动作拆，是按"一类界面"拆）。
 
-原则（用户要求，也是踩坑结论）：
-    · 不解析任务文本，只认界面类型；
-    · 每个 worker 只负责**一个动作**（跳过 / 关闭 / 使用 / 领取 / 自动 / 普攻 / 对话 / 选项 / 追踪 / 血蓝 / 等级）；
-    · 所有点击只经 Executor 一个出口，优先级 0=中断 5=主线；
-    · 任何 worker 崩了不影响其它 worker。
+职责域划分（每个线程 = 一类界面的全部处理，内部可以有分支，但不跨域）：
+    1 skip     过场/剧情      → ▶▶ 跳过（仅无 HUD 时）
+    2 popup    弹窗域         → ✕ 关闭 / 使用 / 领取（都是弹窗上的控件）
+    3 battle   战斗域         → 优先「自动」，没有则普攻+点目标
+    4 dialog   对话域         → 优先「自动」，否则点第一个选项
+    5 tracker  主线域         → 点追踪条，让游戏自己寻路
+    6 monitor  监控域         → HP / MP / 等级（只读，不动手）
 
-线程清单（11 个，全部无状态或只存自身阈值状态）：
-    skip         ▶▶ 跳过过场（仅无 HUD 时）
-    close        ✕ 关闭面板
-    use          使用（道具/礼包）
-    claim        领取（任务/活动奖励）
-    battle_auto  战斗 → 点「自动」
-    battle_atk   战斗 → 普攻 + 点目标（无自动按钮时兜底）
-    dialog_auto  对话 → 点「自动」
-    dialog_opt   对话 → 点选项
-    tracker      主线 → 点追踪条（游戏自己寻路）
-    hpmp         血/蓝条变化（只读）
-    level        等级角标（只读 OCR）
+为什么这样分：
+    · 拆到"每个按钮一个线程"会线程爆炸，同步成本 > 收益（血蓝等级就是一个域）；
+    · 混成"一个大循环"又会互相阻塞（主线 OCR 时弹窗没人管）；
+    · 按界面域拆，每个域内部顺序判断，域间互不阻塞，点击统一走 Executor。
 """
 from __future__ import annotations
 
@@ -51,8 +45,6 @@ def _find(g: np.ndarray, tpl: np.ndarray | None, th: float) -> tuple[int, int, f
 
 
 class BaseWorker(threading.Thread):
-    """只提供节拍 + 帧 + 冷却 + 日志；不含任何业务判断。"""
-
     name_ = "base"
     hz = 5.0
     gap = 2.0
@@ -64,29 +56,30 @@ class BaseWorker(threading.Thread):
         self.running = True
         self.log: list[str] = []
         self._last = 0.0
+        self.cool: dict[str, float] = {}
 
     def say(self, msg: str) -> None:
-        line = f"[{time.strftime('%H:%M:%S')}] {self.name_:11s} {msg}"
+        line = f"[{time.strftime('%H:%M:%S')}] {self.name_:8s} {msg}"
         self.log.append(line)
         print(line, flush=True)
 
-    def frame_gray(self) -> np.ndarray | None:
+    def gray(self) -> np.ndarray | None:
         f, stamp = self.cap.get()
         if f is None or time.time() - stamp > 1.2:
             return None
-        crop = f[40:580, :] if f.shape[0] > 540 else f
-        return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        f = f[40:580, :] if f.shape[0] > 540 else f
+        return cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
 
-    def frame_bgr(self):
+    def bgr(self) -> np.ndarray | None:
         f, stamp = self.cap.get()
         if f is None or time.time() - stamp > 1.2:
             return None
         return f[40:580, :] if f.shape[0] > 540 else f
 
-    def cooled(self) -> bool:
-        if time.time() - self._last < self.gap:
+    def ready(self, key: str, gap: float) -> bool:
+        if time.time() - self.cool.get(key, 0) < gap:
             return False
-        self._last = time.time()
+        self.cool[key] = time.time()
         return True
 
     def step(self) -> None:
@@ -112,141 +105,145 @@ class Probes:
         self.atk = _load("btn_attack")
         self.skill = _load("btn_skill")
         self.speaker = _load("dlg_speaker")
+        self.prompt = _load("dlg_prompt")       # 「请选择要做的事」
+        self.avatar = _load("hero_avatar")      # 人物属性面板本体
+        self.header = _load("panel_header")     # 任务面板本体
+        self.hero_x = _load("hero_close")       # 人物属性 ✕
+        self.hero_x2 = _load("hero_close2")
+        self.panel_x = _load("panel_close")
+        self.panel_x2 = _load("panel_close2")
+
+    def panel_open(self, g) -> bool:
+        """面板判定：必须面板本体 + ✕ 同时命中。
+
+        只靠 ✕ 会误判（实测主界面 hero_close 误命中 0.911），
+        那会让 tracker 永远以为面板开着而不动作。
+        """
+        if self.avatar is not None and _find(g, self.avatar, 0.85):
+            return _find(g, self.hero_x, 0.88) is not None or _find(g, self.hero_x2, 0.88) is not None
+        if self.header is not None and _find(g, self.header, 0.85):
+            return _find(g, self.panel_x, 0.88) is not None or _find(g, self.panel_x2, 0.88) is not None
+        return False
 
     def has_hud(self, g) -> bool:
-        return _find(g, self.task, 0.90) is not None or _find(g, self.friend, 0.90) is not None
+        return _find(g, self.task, 0.85) is not None or _find(g, self.friend, 0.90) is not None
 
     def in_battle(self, g) -> bool:
         return _find(g, self.atk, 0.82) is not None and _find(g, self.skill, 0.82) is not None
 
     def in_dialog(self, g) -> bool:
-        return _find(g, self.speaker, 0.85) is not None
+        return _find(g, self.speaker, 0.85) is not None or _find(g, self.prompt, 0.85) is not None
 
 
-PROBES: Probes | None = None
+P: Probes | None = None
 
 
 def probes() -> Probes:
-    global PROBES
-    if PROBES is None:
-        PROBES = Probes()
-    return PROBES
+    global P
+    if P is None:
+        P = Probes()
+    return P
 
 
-# ---------------------------------------------------------------- 1 跳过过场
+# ---------------------------------------------------------------- 1 过场
 class SkipWorker(BaseWorker):
     name_, hz, gap = "skip", 6.0, 2.0
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.tpls = [t for n in ("cut_ff2", "cut_ff", "cut_manual") if (t := _load(n)) is not None]
+        # 只认"跳过"类按钮（右上 ▶▶）。**不含 cut_manual** —— 那是右下"手动"，
+        # 位置在 (921,490)，点它等于逐句推进，实测会点错地方。
+        self.tpls = [t for n in ("cut_ff3", "cut_ff2", "cut_ff") if (t := _load(n)) is not None]
         self.fixed = (920, 27)
+        self.nohud_streak = 0
 
     def step(self) -> None:
-        g = self.frame_gray()
-        if g is None or probes().has_hud(g) or not self.cooled():
+        g = self.gray()
+        if g is None:
             return
+        # 面板开着就别跳过（面板 ✕ 与 ▶▶ 位置接近，误点会点头像）
+        if probes().panel_open(g):
+            self.nohud_streak = 0
+            return
+        if probes().has_hud(g):
+            self.nohud_streak = 0
+            return
+        # 战斗/对话界面同样没有 HUD，但它们有自己的域，skip 必须让开
+        if probes().in_battle(g) or probes().in_dialog(g):
+            self.nohud_streak = 0
+            return
+        self.nohud_streak += 1
+        if self.nohud_streak < 2 or not self.ready("s", 4.0):
+            return                                  # 连续两帧无 HUD 才动手
+        # 只认模板命中（0.90）。曾经有固定坐标兜底，结果在战斗/加载界面
+        # 无 HUD 时盲点 (933,29) = 点头像，导致开面板→关面板无限循环。
         for tpl in self.tpls:
-            hit = _find(g, tpl, 0.85)
+            hit = _find(g, tpl, 0.90)
             if hit:
                 self.ex.push(0, hit[0], hit[1], "skip")
                 self.say(f"▶▶ ({hit[0]},{hit[1]})")
                 return
-        self.ex.push(0, *self.fixed, "skip")
-        self.say(f"▶▶ 固定坐标 {self.fixed}")
 
 
-# ---------------------------------------------------------------- 2 关闭面板
-class CloseWorker(BaseWorker):
-    name_, hz, gap = "close", 5.0, 2.5
+# ---------------------------------------------------------------- 2 弹窗域
+class PopupWorker(BaseWorker):
+    name_, hz, gap = "popup", 5.0, 2.0
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.tpls = [t for n in ("hero_close2", "hero_close", "panel_close", "panel_close2")
-                     if (t := _load(n)) is not None]
+        # 关窗要确认面板本体在（只靠 ✕ 会误关战斗/其它界面的关闭按钮）
+        self.avatar = _load("hero_avatar")           # 人物属性面板特征
+        self.header = _load("panel_header")          # 任务面板「任务」横幅
+        self.hero_closes = [t for n in ("hero_close2", "hero_close") if (t := _load(n)) is not None]
+        self.panel_closes = [t for n in ("panel_close", "panel_close2") if (t := _load(n)) is not None]
+        self.popup_closes = [t for n in ("popup_close",) if (t := _load(n)) is not None]
+        self.uses = [t for n in ("use_btn", "claim_btn", "popup_use") if (t := _load(n)) is not None]
 
     def step(self) -> None:
-        g = self.frame_gray()
-        if g is None or not self.cooled():
+        g = self.gray()
+        if g is None or not self.ready("p", self.gap):
             return
-        for tpl in self.tpls:
-            hit = _find(g, tpl, 0.88)
-            if hit:
-                self.ex.push(0, hit[0], hit[1], "close")
-                self.say(f"✕ ({hit[0]},{hit[1]})")
-                return
-
-
-# ---------------------------------------------------------------- 3 使用
-class UseWorker(BaseWorker):
-    name_, hz, gap = "use", 5.0, 2.0
-
-    def __init__(self, cap, ex):
-        super().__init__(cap, ex)
-        self.tpls = [t for n in ("use_btn", "popup_use") if (t := _load(n)) is not None]
-
-    def step(self) -> None:
-        g = self.frame_gray()
-        if g is None or not self.cooled():
-            return
-        for tpl in self.tpls:
+        # 先点"使用/领取"（有奖励就先拿），没有再关窗
+        for tpl in self.uses:
             hit = _find(g, tpl, 0.86)
             if hit:
-                self.ex.push(0, hit[0], hit[1], "use")
-                self.say(f"使用 ({hit[0]},{hit[1]})")
+                self.ex.push(0, hit[0], hit[1], "popup:use")
+                self.say(f"使用/领取 ({hit[0]},{hit[1]})")
+                return
+        if self.avatar is not None and _find(g, self.avatar, 0.85):
+            for tpl in self.hero_closes:
+                hit = _find(g, tpl, 0.88)
+                if hit:
+                    self.ex.push(0, hit[0], hit[1], "popup:close-hero")
+                    self.say(f"✕ 人物属性 ({hit[0]},{hit[1]})")
+                    return
+        # 注意：**不要关任务面板** —— 那是 tracker 域的工作面板，
+        # 关掉会造成"开面板 ↔ 关面板"死循环（实测每 14 秒一轮）。
+        for tpl in self.popup_closes:
+            hit = _find(g, tpl, 0.88)
+            if hit:
+                self.ex.push(0, hit[0], hit[1], "popup:close")
+                self.say(f"✕ 弹窗 ({hit[0]},{hit[1]})")
                 return
 
 
-# ---------------------------------------------------------------- 4 领取
-class ClaimWorker(BaseWorker):
-    name_, hz, gap = "claim", 5.0, 2.5
-
-    def __init__(self, cap, ex):
-        super().__init__(cap, ex)
-        self.tpl = _load("claim_btn")
-
-    def step(self) -> None:
-        g = self.frame_gray()
-        if g is None or not self.cooled():
-            return
-        hit = _find(g, self.tpl, 0.86)
-        if hit:
-            self.ex.push(0, hit[0], hit[1], "claim")
-            self.say(f"领取 ({hit[0]},{hit[1]})")
-
-
-# ---------------------------------------------------------------- 5 战斗→自动
-class BattleAutoWorker(BaseWorker):
-    name_, hz, gap = "battle_auto", 2.0, 6.0
+# ---------------------------------------------------------------- 3 战斗域
+class BattleWorker(BaseWorker):
+    name_, hz, gap = "battle", 2.0, 2.5
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
         self.auto = _load("battle_auto")
 
     def step(self) -> None:
-        g = self.frame_gray()
-        if g is None or not probes().in_battle(g) or not self.cooled():
+        g = self.gray()
+        if g is None or not probes().in_battle(g) or not self.ready("b", self.gap):
             return
         hit = _find(g, self.auto, 0.85)
         if hit:
             self.ex.push(0, hit[0], hit[1], "battle:auto")
-            self.say(f"点自动 ({hit[0]},{hit[1]})")
-
-
-# ---------------------------------------------------------------- 6 战斗→普攻
-class BattleAttackWorker(BaseWorker):
-    name_, hz, gap = "battle_atk", 2.0, 2.2
-
-    def __init__(self, cap, ex):
-        super().__init__(cap, ex)
-        self.auto = _load("battle_auto")
-
-    def step(self) -> None:
-        g = self.frame_gray()
-        if g is None or not probes().in_battle(g) or not self.cooled():
+            self.say(f"自动 ({hit[0]},{hit[1]})")
             return
-        if _find(g, self.auto, 0.85):
-            return                       # 有自动按钮就交给 battle_auto
         atk = _find(g, probes().atk, 0.82)
         if atk:
             self.ex.push(5, atk[0], atk[1], "battle:attack")
@@ -255,77 +252,86 @@ class BattleAttackWorker(BaseWorker):
             self.say("普攻 + 点目标")
 
 
-# ---------------------------------------------------------------- 7 对话→自动
-class DialogAutoWorker(BaseWorker):
-    name_, hz, gap = "dialog_auto", 3.0, 8.0
+# ---------------------------------------------------------------- 4 对话域
+class DialogWorker(BaseWorker):
+    name_, hz, gap = "dialog", 3.0, 3.0
+
+    PROMPT_DY = 48          # 选项按钮相对「请选择要做的事」标题的纵向偏移（实测）
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
         self.auto = _load("dlg_auto")
+        self.prompt = _load("dlg_prompt")
 
     def step(self) -> None:
-        g = self.frame_gray()
-        if g is None or not probes().in_dialog(g) or not self.cooled():
+        g = self.gray()
+        if g is None or not probes().in_dialog(g) or not self.ready("d", self.gap):
             return
+        # ① 有「自动」按钮 → 点它（对话自动推进）
         hit = _find(g, self.auto, 0.85)
         if hit:
             self.ex.push(0, hit[0], hit[1], "dialog:auto")
-            self.say(f"点自动 ({hit[0]},{hit[1]})")
-
-
-# ---------------------------------------------------------------- 8 对话→选项
-class DialogOptionWorker(BaseWorker):
-    name_, hz, gap = "dialog_opt", 3.0, 2.5
-
-    def __init__(self, cap, ex):
-        super().__init__(cap, ex)
-        self.opt = _load("dialog_option")
-        self.fixed = (790, 356)
-
-    def step(self) -> None:
-        g = self.frame_gray()
-        if g is None or not probes().in_dialog(g) or not self.cooled():
+            self.say(f"自动 ({hit[0]},{hit[1]})")
             return
-        hit = _find(g, self.opt, 0.85)
-        if hit:
-            self.ex.push(5, hit[0], hit[1], "dialog:option")
-            self.say(f"点选项 ({hit[0]},{hit[1]})")
-        else:
-            self.ex.push(5, *self.fixed, "dialog:option")
-            self.say(f"点选项(固定) {self.fixed}")
+        # ② 有「请选择要做的事」标题 → 点标题正下方的选项（不依赖选项文字）
+        pr = _find(g, self.prompt, 0.85)
+        if pr:
+            self.ex.push(5, pr[0], pr[1] + self.PROMPT_DY, "dialog:option")
+            self.say(f"选项 ({pr[0]},{pr[1] + self.PROMPT_DY})")
 
 
-# ---------------------------------------------------------------- 9 主线→追踪条
+# ---------------------------------------------------------------- 5 主线域
 class TrackerWorker(BaseWorker):
-    name_, hz, gap = "tracker", 0.2, 8.0
+    """主线域：只要在主界面就点追踪条的目标行，让游戏自己寻路。
+
+    不再依赖 quest_track 模板 —— 追踪条里是**任务文字**，文字一变模板就失效
+    （实测换成"打败老鼠精"后匹配度 0.000）。位置是固定的，直接点。
+    """
+
+    name_, hz, gap = "tracker", 0.2, 12.0
+    TASK_BTN = (823, 96)             # 「任务」按钮（开面板）
+    TELEPORT = (756, 436)            # 面板里的「马上传送」
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.track = _load("quest_track")
+        self.tele_tpl = _load("panel_teleport")
 
     def step(self) -> None:
-        g = self.frame_gray()
-        if g is None or not self.cooled():
+        g = self.gray()
+        if g is None:
             return
-        if _find(g, probes().task, 0.90) is None:
+        panel_open = probes().panel_open(g)
+
+        # ① 面板开着：有「马上传送」就点它（主线推进的主力动作）
+        if panel_open:
+            hit = _find(g, self.tele_tpl, 0.85)
+            if hit and self.ready("tele", 6.0):
+                self.ex.push(5, hit[0], hit[1], "quest:teleport")
+                self.say(f"面板 → 马上传送 ({hit[0]},{hit[1]})")
+            return
+
+        # ② 主界面：开任务面板（冷却 12 s，避免反复开关）
+        if not probes().has_hud(g):
             return
         if probes().in_battle(g) or probes().in_dialog(g):
             return
-        hit = _find(g, self.track, 0.85)
-        target = (hit[0], hit[1] + 30) if hit else (855, 180)
-        self.ex.push(5, *target, "tracker")
-        self.say(f"点追踪条 {target}")
+        if self.ready("open", self.gap):
+            self.ex.push(5, *self.TASK_BTN, "quest:open-task")
+            self.say(f"打开任务面板 {self.TASK_BTN}")
 
 
-# ---------------------------------------------------------------- 10 血蓝监控
-class HpMpWorker(BaseWorker):
-    name_, hz, gap = "hpmp", 1.0, 0.0
+# ---------------------------------------------------------------- 6 监控域
+class MonitorWorker(BaseWorker):
+    """只读：血 / 蓝 / 等级。三件事同域（都是"看自己状态"）。"""
+
+    name_, hz, gap = "monitor", 1.0, 0.0
     HP_ROI = (824, 2, 62, 12)
     MP_ROI = (824, 14, 62, 12)
+    LV_ROI = (846, 38, 42, 26)
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.hp = self.mp = None
+        self.hp = self.mp = self.level = None
         self.events: list[str] = []
 
     @staticmethod
@@ -339,9 +345,12 @@ class HpMpWorker(BaseWorker):
         return float(cols.max() + 1) / w if cols.size else 0.0
 
     def step(self) -> None:
-        f = self.frame_bgr()
+        f = self.bgr()
         if f is None:
             return
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        if not probes().has_hud(g) or probes().panel_open(g):
+            return                                   # 面板/过场遮挡时读数不可信
         hp = self._bar(f, self.HP_ROI, (0, 90, 90), (12, 255, 255))
         mp = self._bar(f, self.MP_ROI, (100, 90, 90), (130, 255, 255))
         if hp is not None and (self.hp is None or abs(hp - self.hp) > 0.05):
@@ -349,52 +358,38 @@ class HpMpWorker(BaseWorker):
             self.say(f"HP {hp:.0%}")
             if hp < 0.3:
                 self.events.append(f"LOW_HP {hp:.0%}")
+                self.say("⚠ 血量低")
         if mp is not None and (self.mp is None or abs(mp - self.mp) > 0.05):
             self.mp = mp
             self.say(f"MP {mp:.0%}")
+        if self.ready("lv", 20.0):
+            lv = self._ocr_level(f)
+            if lv and lv != self.level:
+                self.say(f"LV {self.level} -> {lv}")
+                self.level = lv
 
-
-# ---------------------------------------------------------------- 11 等级监控
-class LevelWorker(BaseWorker):
-    name_, hz, gap = "level", 0.05, 0.0      # 20 秒一次
-    LV_ROI = (846, 38, 42, 26)
-
-    def __init__(self, cap, ex):
-        super().__init__(cap, ex)
-        self.level = None
-
-    def step(self) -> None:
-        f = self.frame_bgr()
-        if f is None:
-            return
+    def _ocr_level(self, f: np.ndarray) -> int | None:
         x, y, w, h = self.LV_ROI
         crop = f[y:y + h, x:x + w]
         if crop.size == 0:
-            return
+            return None
         try:
             from rapidocr_onnxruntime import RapidOCR
             big = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
             out = RapidOCR()(big)
         except Exception:
-            return
+            return None
         if not out or not out[0]:
-            return
+            return None
         for _b, txt, sc in out[0]:
             d = "".join(ch for ch in txt if ch.isdigit())
             if d and float(sc) > 0.5 and 1 <= int(d) <= 175:
-                if int(d) != self.level:
-                    self.say(f"LV {self.level} -> {int(d)}")
-                    self.level = int(d)
-                return
+                return int(d)
+        return None
 
 
 # ---------------------------------------------------------------- 编排
-WORKER_CLASSES = [
-    SkipWorker, CloseWorker, UseWorker, ClaimWorker,
-    BattleAutoWorker, BattleAttackWorker,
-    DialogAutoWorker, DialogOptionWorker,
-    TrackerWorker, HpMpWorker, LevelWorker,
-]
+WORKER_CLASSES = [SkipWorker, PopupWorker, BattleWorker, DialogWorker, TrackerWorker, MonitorWorker]
 
 
 @dataclass
@@ -407,9 +402,9 @@ class Fleet:
     def start(cls, pid: int, fps: float = 8.0) -> "Fleet":
         dpi_aware()
         cap, ex = Capture(pid, fps=fps), Executor()
-        probes()                                  # 预热模板
+        probes()
         fleet = cls(cap=cap, ex=ex)
-        fleet.workers = [cls_(cap, ex) for cls_ in WORKER_CLASSES]
+        fleet.workers = [c(cap, ex) for c in WORKER_CLASSES]
         ex.start()
         cap.start()
         for w in fleet.workers:
