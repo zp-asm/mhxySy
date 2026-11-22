@@ -100,42 +100,13 @@ def read_level_badge(eyes: Eyes) -> int | None:
     return None
 
 
-def read_level(eyes: Eyes, act: bool) -> int | None:
-    """读等级：OCR「N级」。当前界面若没有，就先点头像开人物属性。"""
-    # 首选：头像旁红框角标（不需要开面板）
-    lv = read_level_badge(eyes)
-    if lv is not None:
-        return lv
+def read_level(eyes: Eyes, act: bool = False) -> int | None:
+    """只读头像旁的红框角标。
 
-    s = eyes.tick()
-    t = find_text(s, "级", region=LEVEL_ROI)
-    if not t:
-        t = find_text(s, "级", region=(80, 40, 620, 220))   # 放宽兜底
-    if not t:
-        if not act:
-            return None
-        if "hero_avatar" in s.hits:
-            cx, cy = s.hits["hero_avatar"].center
-        else:
-            cx, cy = (150, 96)                            # 头像常驻位置兜底
-        adb_tap(cx, cy)
-        time.sleep(1.2)
-        s = eyes.tick()
-        t = find_text(s, "级", region=(80, 40, 520, 200))
-    if not t:
-        return None
-    text = t[2]
-    s2 = s.base[t[2][1]:t[2][1] + t[2][3], t[2][0]:t[2][0] + t[2][2]]
-    # 用 OCR 文本里的数字兜底
-    from rapidocr_onnxruntime import RapidOCR
-    big = cv2.resize(s2, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    out = RapidOCR()(big)
-    if out and out[0]:
-        for _, txt, _sc in out[0]:
-            digits = "".join(ch for ch in txt if ch.isdigit())
-            if digits:
-                return int(digits)
-    return None
+    历史教训：曾经"读不到就点头像开人物属性"，结果和"关面板"逻辑打架，
+    出现「关了又开」的循环。角标 OCR 足够可靠（实测 1.00），不再提供打开面板的路径。
+    """
+    return read_level_badge(eyes)
 
 
 def click_text(eyes: Eyes, sense: Sense, needle: str, act: bool,

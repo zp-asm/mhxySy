@@ -37,6 +37,8 @@ class Pilot:
         self.stuck_sec = stuck_sec
         self.cool: dict[str, float] = {}
         self.last_state = ""
+        self.cand_state = ""
+        self.cand_count = 0
         self.last_change = time.time()
         self.stats = {"popup": 0, "cut": 0, "dialog": 0, "panel": 0, "teleport": 0}
 
@@ -59,11 +61,23 @@ class Pilot:
 
     def tick(self) -> str:
         s = self.eyes.tick()
-        st = s.state
+        raw = s.state
+        # ---- 去抖：同一状态连续 2 帧才采纳
+        if raw == self.cand_state:
+            self.cand_count += 1
+        else:
+            self.cand_state, self.cand_count = raw, 1
+        st = raw if self.cand_count >= 2 else self.last_state
         if st != self.last_state:
             log(f"state {self.last_state or '-'} -> {st}")
             self.last_state = st
             self.last_change = time.time()
+
+        # ---- HERO_PANEL：只关，不开（曾经因为"读等级"去点头像导致关了又开）
+        if st == "HERO_PANEL":
+            if self.tap_hit(s, "hero_close", "hero-close", 3.0):
+                pass
+            return st
 
         # ---- POPUP
         if st == "POPUP":
@@ -73,9 +87,11 @@ class Pilot:
                 self.stats["popup"] += 1
             return st
 
-        # ---- CUTSCENE
+        # ---- CUTSCENE：优先跳过（右上 ▶▶），没有再逐句手动
         if st == "CUTSCENE":
-            if self.tap_hit(s, "cut_manual", "cut", 1.2):
+            if self.tap_hit(s, "cut_ff2", "skip", 2.0) or self.tap_hit(s, "cut_ff", "skip", 2.0):
+                self.stats["cut"] += 1
+            elif self.tap_hit(s, "cut_manual", "cut-manual", 1.2):
                 self.stats["cut"] += 1
             return st
 
@@ -113,10 +129,21 @@ class Pilot:
         # ---- MAIN_UI：只观察，卡住才兜底
         if st == "MAIN_UI":
             idle = time.time() - self.last_change
-            if idle > self.stuck_sec and self.ready("open-task", 20.0):
-                log(f"main: 卡住 {idle:.0f}s → 打开任务面板")
-                if self.tap_hit(s, "task_btn", "open-task", 1.0):
-                    pass
+            if idle > self.stuck_sec:
+                # 兜底 1：点追踪条的目标行（游戏自带寻路），这是最轻的动作
+                if self.ready("tracker-tap", 12.0):
+                    box = s.hits["quest_track"].box if "quest_track" in s.hits else (760, 134, 190, 64)
+                    tx, ty = box[0] + box[2] // 2, box[1] + int(box[3] * 0.72)
+                    if self.act:
+                        adb_tap(tx, ty)
+                    log(f"main: 卡住 {idle:.0f}s → 点追踪条目标行 ({tx},{ty}){'' if self.act else '  [dry]'}")
+                    self.last_change = time.time()
+                    return st
+                # 兜底 2：开任务面板 → 主线页 → 马上传送
+                if self.ready("open-task", 25.0):
+                    log(f"main: 仍卡住 → 打开任务面板")
+                    if self.tap_hit(s, "task_btn", "open-task", 1.0):
+                        pass
             return st
 
         return st

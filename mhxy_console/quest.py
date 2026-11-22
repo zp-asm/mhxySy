@@ -64,6 +64,7 @@ CUTSCENE_ANCHORS: dict[str, tuple[float, int]] = {
     "cut_ff":       (0.85, 16),
     "cut_skip":     (0.85, 16),
     "cut_subtitle": (0.72, 8),
+    "cut_ff2":      (0.85, 16),
 }
 
 # NPC 对话（右下「自动」+ 右上 ▶▶ + 说话人铭牌 + 正文）
@@ -85,6 +86,7 @@ POPUP_ANCHORS: dict[str, tuple[float, int]] = {
 HERO_ANCHORS: dict[str, tuple[float, int]] = {
     "hero_close":  (0.88, 20),
     "hero_avatar": (0.85, 30),
+    "hero_close2": (0.88, 18),
 }
 
 # 这 4 个是在"面板打开"的帧里采的，纹理其实是面板边缘 → 面板关闭后必须重采
@@ -138,9 +140,9 @@ class Sense:
         # 过场优先：黑屏字幕的状态下别的锚点都会失效
         if self.has("popup_use") or self.has("popup_close"):
             return "POPUP"
-        if self.has("hero_close"):
+        if self.has("hero_close") or self.has("hero_close2"):
             return "HERO_PANEL"
-        if self.has("cut_manual") and self.has("cut_ff"):
+        if self.has("cut_ff") or self.has("cut_ff2"):
             return "CUTSCENE"
         if self.has("dlg_auto") or (self.has("dlg_speaker") and self.has("dlg_ff")):
             return "DIALOG"
