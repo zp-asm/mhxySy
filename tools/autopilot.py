@@ -40,7 +40,7 @@ class Pilot:
         self.cand_state = ""
         self.cand_count = 0
         self.last_change = time.time()
-        self.stats = {"popup": 0, "cut": 0, "dialog": 0, "panel": 0, "teleport": 0}
+        self.stats = {"popup": 0, "cut": 0, "dialog": 0, "panel": 0, "teleport": 0, "battle": 0}
         self.level = None
         self.last_report = 0.0
 
@@ -101,6 +101,17 @@ class Pilot:
             self.last_state = st
             self.last_change = time.time()
 
+        # ---- BATTLE：攻击 → 点目标，循环
+        if st == "BATTLE":
+            if self.ready("battle-atk", 2.0):
+                if self.act:
+                    adb_tap(930, 390)      # 攻击
+                    time.sleep(0.5)
+                    adb_tap(245, 255)      # 点目标（默认左侧敌人）
+                log(f"battle: 攻击+点目标{'' if self.act else '  [dry]'}")
+                self.stats["battle"] += 1
+            return st
+
         # ---- HERO_PANEL：只关，不开（曾经因为"读等级"去点头像导致关了又开）
         if st == "HERO_PANEL":
             for k in ("hero_close2", "hero_close"):
@@ -115,6 +126,18 @@ class Pilot:
             elif self.tap_hit(s, "popup_close", "popup-close", 2.0):
                 self.stats["popup"] += 1
             return st
+
+        # 通用弹窗兜底：任意位置出现「使用/领取/确定/打开」就点（实测副本/宝箱弹窗都用这个）
+        if self.ready("generic-use", 3.0):
+            from mhxy_console.quest import find_text
+            for word in ("使用", "领取", "确定", "打开"):
+                t = find_text(s, word, region=(560, 240, 400, 300))
+                if t:
+                    if self.act:
+                        adb_tap(t[0], t[1])
+                    log(f"generic: 点「{word}」({t[0]},{t[1]}){'' if self.act else '  [dry]'}")
+                    self.stats["popup"] += 1
+                    return st
 
         # ---- CUTSCENE：优先跳过（右上 ▶▶），没有再逐句手动
         if st == "CUTSCENE":

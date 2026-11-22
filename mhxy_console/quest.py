@@ -82,6 +82,13 @@ POPUP_ANCHORS: dict[str, tuple[float, int]] = {
     "popup_title": (0.82, 16),
 }
 
+# 战斗（右侧竖排：法术/特技/攻击/道具；底部：逃跑/召唤/…）
+BATTLE_ANCHORS: dict[str, tuple[float, int]] = {
+    "btn_attack": (0.85, 20),
+    "btn_skill":  (0.85, 20),
+    "btn_flee":   (0.85, 20),
+}
+
 # 人物属性面板（✕ + 头像）
 HERO_ANCHORS: dict[str, tuple[float, int]] = {
     "hero_close":  (0.88, 20),
@@ -149,6 +156,8 @@ class Sense:
         # 过场优先：黑屏字幕的状态下别的锚点都会失效
         if self.has("popup_use") or self.has("popup_close"):
             return "POPUP"
+        if self.has("btn_attack") and self.has("btn_skill"):
+            return "BATTLE"
         if self.has("hero_close") or self.has("hero_close2"):
             return "HERO_PANEL"
         # 过场必须"暗"：右上角 ▶▶ 模板在主界面头像区也会误命中，光靠模板会把主界面当过场，
@@ -187,6 +196,7 @@ class Locator:
         merged.update(DIALOG_ANCHORS)
         merged.update(POPUP_ANCHORS)
         merged.update(HERO_ANCHORS)
+        merged.update(BATTLE_ANCHORS)
         for name, (thresh, pad) in merged.items():
             png = self.dir / f"{name}.png"
             if not png.exists():
