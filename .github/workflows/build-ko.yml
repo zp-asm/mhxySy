@@ -3,7 +3,8 @@ name: build-ko
 # 云端编两样东西，本机不装任何软件：
 #   1) mhxy_drv.ko   内核模块（x86_64）
 #   2) kread         静态 Android x86_64 客户端（设备上没有 python，必须给二进制）
-# 触发：Actions 页面 "Run workflow"，或 push 到 drv/**
+#
+# 失败时也会把构建日志发布成公开 Release（tag=ci-log），便于不带凭据排查。
 on:
   workflow_dispatch:
   push:
@@ -16,14 +17,15 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     permissions:
-      contents: write        # 建 Release 用（便于匿名下载产物）
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
       - name: 安装依赖
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential bc flex bison libelf-dev libssl-dev xz-utils wget unzip
+          sudo apt-get install -y -qq build-essential bc flex bison libelf-dev libssl-dev \
+            xz-utils wget unzip dwarves || true
 
       - name: 内核源码 + modules_prepare
         run: |
@@ -31,47 +33,66 @@ jobs:
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.90.tar.xz
           tar xf linux-6.1.90.tar.xz
           cd linux-6.1.90
-          make ARCH=x86_64 defconfig >/dev/null
-          make ARCH=x86_64 modules_prepare >/dev/null
+          make ARCH=x86_64 defconfig >/dev/null 2>&1
+          make ARCH=x86_64 modules_prepare 2>&1 | tail -20
           echo "KDIR=$PWD" >> "$GITHUB_ENV"
 
       - name: 编内核模块
+        id: ko
+        continue-on-error: true
         run: |
+          set -o pipefail
           cd drv
-          # KBUILD_MODPOST_WARN=1：无 Module.symvers 时把 "no symbol version" 降级为警告
-          make -j"$(nproc)" KDIR="$KDIR" ARCH=x86_64 KBUILD_MODPOST_WARN=1
+          make -j"$(nproc)" KDIR="$KDIR" ARCH=x86_64 KBUILD_MODPOST_WARN=1 2>&1 \
+            | tee "$RUNNER_TEMP/build-ko.log"
+          ls -l mhxy_drv.ko
 
       - name: 编静态客户端（NDK r27c）
+        id: cli
+        if: steps.ko.outcome == 'success'
+        continue-on-error: true
         run: |
+          set -o pipefail
           cd "$RUNNER_TEMP"
           wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
           unzip -q android-ndk-r27c-linux.zip
           CC="$PWD/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang"
-          "$CC" -static -O2 -s -o "$GITHUB_WORKSPACE/drv/kread" "$GITHUB_WORKSPACE/drv/kread.c"
+          "$CC" -static -O2 -s -o "$GITHUB_WORKSPACE/drv/kread" "$GITHUB_WORKSPACE/drv/kread.c" 2>&1 | tee "$RUNNER_TEMP/build-cli.log"
           file "$GITHUB_WORKSPACE/drv/kread"
 
-      - name: 产物检查
+      - name: 结果汇总
+        if: always()
         run: |
-          ls -l drv/mhxy_drv.ko drv/kread
-          file drv/mhxy_drv.ko
-          modinfo drv/mhxy_drv.ko || true
+          {
+            echo "ko step   = ${{ steps.ko.outcome }}"
+            echo "cli step  = ${{ steps.cli.outcome }}"
+            echo
+            echo "===== build-ko.log (tail 120) ====="
+            tail -120 "$RUNNER_TEMP/build-ko.log" 2>/dev/null || echo "(no ko log)"
+            echo
+            echo "===== build-cli.log (tail 60) ====="
+            tail -60 "$RUNNER_TEMP/build-cli.log" 2>/dev/null || echo "(no cli log)"
+          } > "$RUNNER_TEMP/report.txt"
+          cat "$RUNNER_TEMP/report.txt"
 
-      - name: 上传 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mhxy_drv-ko
-          path: |
-            drv/mhxy_drv.ko
-            drv/kread
-          if-no-files-found: error
-
-      - name: 发 Release（产物可直接匿名下载）
+      - name: 发布日志（公开可下载，便于排查）
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          cp "$RUNNER_TEMP/report.txt" "$GITHUB_WORKSPACE/report.txt" || true
+          gh release delete ci-log --yes --cleanup-tag 2>/dev/null || true
+          gh release create ci-log "$GITHUB_WORKSPACE/report.txt" \
+            --title "ci-log $(date -u +%F_%H%M)" \
+            --notes "build=${{ steps.ko.outcome }} client=${{ steps.cli.outcome }}" || true
+
+      - name: 发布产物（仅在成功时）
+        if: steps.ko.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -l drv/mhxy_drv.ko drv/kread 2>/dev/null || true
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
           gh release create latest drv/mhxy_drv.ko drv/kread \
-            --title "latest ($(date -u +%Y%m%d-%H%M))" \
-            --notes "auto build: mhxy_drv.ko + kread" \
-            --latest
-
+            --title "latest $(date -u +%F_%H%M)" \
+            --notes "auto build" --latest
