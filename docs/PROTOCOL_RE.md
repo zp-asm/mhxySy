@@ -87,3 +87,69 @@ pcap：**1.9 MB / 2071 包 / 10 条流**，linktype=276（Linux SLL2，注意解
 - **短期**：图色继续跑（今天实测 3 级 → 14 级，主线推进正常），不阻塞收益
 - **中期**：协议作为并行研究，只做**只读传感器**（不改上行、不发包），目标是把 `MonitorWorker` 的 HP/MP/等级和任务状态从"看图"换成"读包"
 - **不要做**：完整协议驱动（自己构造上行指令）——握手/序列号/反重放 + `libsecsdk` 监控，风险与成本都不划算
+
+---
+
+# 第二轮：直接啃（2026-11-22 晚）
+
+## 6. 关键修正：`libtcb.so` 不是游戏网络库
+
+它的字符串全是 **Houdini 的 CPU 特性表**（`sse/avx/aes/pclmul`、`libhoudini.so`、
+`Houdini_15.0/src/ubt-ia/...`）。所以 Frida 里 `recv` 的调用者 `libtcb.so+0xa24f0`
+是 **ARM→x86 桥接层**，不是游戏的收包函数。
+
+## 7. `libGame.so` 文件是加密的，运行时才解密
+
+对比同一地址的文件与内存：
+
+| 偏移 | 文件 | 内存 |
+|---|---|---|
+| `0x2000000` | `081740f9...` | `081740f9...`（一致，明文代码） |
+| `0x120b000` | `2ea8ca4b4a8c48aa…`（密文） | `4672616d65537562…` = **"FrameSubPassSolo"**（明文） |
+
+→ 静态分析必须用**内存 dump**，不能用磁盘文件。
+
+dump 命令（root）：
+
+```bash
+adb shell "dd if=/proc/$(pidof com.netease.my)/mem \
+  of=/data/local/tmp/libGame_mem.bin bs=4096 skip=17180003328 count=17197"
+# 0x400020c00000 起 67 MB，0.24 秒完成
+```
+
+## 8. 解密镜像里挖到的关键信息（130,996 条字符串）
+
+- **OpenSSL 是静态编译进 libGame 的**（442 条 `src/External/openssl/openssl/...` 路径）
+  → 之前 hook 系统 `libcrypto.so` 才 0 命中，真正的 EVP 是 **ARM 代码**
+- `Java_com_netease_messiah_Channel_NativeOnProtocolFinish` → 协议层在 **Messiah Channel**
+- `unhandled opcode: ` → 存在 opcode 分发表
+- `cc.CCrypto:privateDecryptRSA / endecryptData` → Lua 侧还暴露了加解密接口
+- 无 mbedtls / cryptopp / wolfssl / xxtea / rijndael 字符串
+
+## 9. AES 密钥搜索（已扫 ~330 MB，未命中）
+
+工具：`tools/find_aes_key_fast.py`（numpy 向量化预筛 + 完整扩展校验，**已用合成密钥自测通过**）。
+
+| 区域 | 大小 | 结果 |
+|---|---|---|
+| libGame rw 段 | 4.8 MB | 0 |
+| scudo:primary（最大） | 79 MB | 0 |
+| Houdini 客户机堆 anon | 160 MB | 0 |
+| scudo:primary ×2 | 46+45 MB | 0 |
+
+→ 结论：**游戏协议很可能不是 AES**（OpenSSL 只用于 HTTPS/nghttp2）；
+或者密钥在尚未扫到的区域（进程 rw 共 6 GB）。
+
+## 10. 下一步（两条并行）
+
+1. **全量扫 rw 区**（6 GB，`dd` + 向量化扫描，约 10 分钟）
+2. **静态定位 opcode 分发器**：在解密镜像里找 `unhandled opcode:` 字符串的引用
+   （`ADRP`+`ADD` 寻址），拿到 switch 就能看到解包→解密的调用顺序，
+   直接读出 cipher 与 key 的来源（比盲扫内存快得多）
+
+## 11. 环境备忘
+
+- `adb root` 可用；`/system/bin/tcpdump` 自带
+- frida-server 17.27.4（android-x86_64）已部署，端口 27042
+- **Frida 的 Java 桥在这个进程里不可用**（`Java is not defined`），
+  所以 Messiah Channel 的 Java 层 hook 走不通，只能走 native
