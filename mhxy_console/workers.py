@@ -282,42 +282,89 @@ class DialogWorker(BaseWorker):
 
 # ---------------------------------------------------------------- 5 主线域
 class TrackerWorker(BaseWorker):
-    """主线域：只要在主界面就点追踪条的目标行，让游戏自己寻路。
+    """主线域（完全不识别任务内容）。
 
-    不再依赖 quest_track 模板 —— 追踪条里是**任务文字**，文字一变模板就失效
-    （实测换成"打败老鼠精"后匹配度 0.000）。位置是固定的，直接点。
+    步骤机：
+        0 主界面      → 点「任务」开面板
+        1 面板打开    → 点主线条目（固定位置 292,129）
+        2 进入详情    → 点详情里的按钮（马上传送/前往，固定位置 756,436）
+        然后回到 0（传送后自然会离开面板）
     """
 
-    name_, hz, gap = "tracker", 0.2, 12.0
-    TASK_BTN = (823, 96)             # 「任务」按钮（开面板）
-    TELEPORT = (756, 436)            # 面板里的「马上传送」
+    name_, hz, gap = "tracker", 0.5, 3.0
+    TASK_BTN = (823, 96)
+    CHAPTER = (292, 129)          # 主线剧情下的第一条
+    ACTION = (756, 436)           # 详情页按钮（马上传送）
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.tele_tpl = _load("panel_teleport")
+        self.step_no = 0
+        self.fail = 0
 
     def step(self) -> None:
         g = self.gray()
-        if g is None:
+        if g is None or not self.ready("t", self.gap):
             return
         panel_open = probes().panel_open(g)
 
-        # ① 面板开着：有「马上传送」就点它（主线推进的主力动作）
-        if panel_open:
-            hit = _find(g, self.tele_tpl, 0.85)
-            if hit and self.ready("tele", 6.0):
-                self.ex.push(5, hit[0], hit[1], "quest:teleport")
-                self.say(f"面板 → 马上传送 ({hit[0]},{hit[1]})")
+        if self.step_no == 0:
+            if panel_open:
+                self.step_no = 1
+            elif probes().has_hud(g) and not probes().in_battle(g) and not probes().in_dialog(g):
+                self.ex.push(5, *self.TASK_BTN, "quest:open")
+                self.say("开任务面板")
             return
 
-        # ② 主界面：开任务面板（冷却 12 s，避免反复开关）
-        if not probes().has_hud(g):
+        if self.step_no == 1:
+            if not panel_open:
+                self.step_no = 0
+                return
+            self.ex.push(5, *self.CHAPTER, "quest:chapter")
+            self.say("点主线条目")
+            self.step_no = 2
+            return
+
+        # step 2：详情页 → 点按钮；点完还在面板里（没传送）= 这一步没按钮，关面板回场景
+        if not panel_open:
+            self.step_no = 0
+            self.fail = 0
+            return
+        self.ex.push(5, *self.ACTION, "quest:action")
+        self.say("点详情按钮")
+        self.fail += 1
+        if self.fail >= 2:
+            self.ex.push(5, 856, 42, "quest:close-panel")
+            self.say("详情无按钮 → 关面板，交给场景域")
+            self.fail = 0
+            self.gap = 20.0        # 退避，避免面板开合刷屏
+        self.step_no = 0
+
+
+# ---------------------------------------------------------------- 5.5 场景交互
+class SceneWorker(BaseWorker):
+    """场景交互域：主界面里出现「战」标记就点它（进战斗/接对话）。
+
+    不识别任务内容 —— 只看场景里有没有这个通用标记。
+    """
+
+    name_, hz, gap = "scene", 1.0, 8.0
+
+    def __init__(self, cap, ex):
+        super().__init__(cap, ex)
+        self.mark = _load("scene_battle")
+
+    def step(self) -> None:
+        g = self.gray()
+        if g is None or not self.ready("s", self.gap):
+            return
+        if not probes().has_hud(g) or probes().panel_open(g):
             return
         if probes().in_battle(g) or probes().in_dialog(g):
             return
-        if self.ready("open", self.gap):
-            self.ex.push(5, *self.TASK_BTN, "quest:open-task")
-            self.say(f"打开任务面板 {self.TASK_BTN}")
+        hit = _find(g, self.mark, 0.85)
+        if hit:
+            self.ex.push(5, hit[0], hit[1], "scene:battle-mark")
+            self.say(f"点场景「战」标记 ({hit[0]},{hit[1]})")
 
 
 # ---------------------------------------------------------------- 6 监控域
@@ -389,7 +436,8 @@ class MonitorWorker(BaseWorker):
 
 
 # ---------------------------------------------------------------- 编排
-WORKER_CLASSES = [SkipWorker, PopupWorker, BattleWorker, DialogWorker, TrackerWorker, MonitorWorker]
+WORKER_CLASSES = [SkipWorker, PopupWorker, BattleWorker, DialogWorker,
+                  TrackerWorker, SceneWorker, MonitorWorker]
 
 
 @dataclass

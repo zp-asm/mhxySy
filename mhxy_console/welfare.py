@@ -169,39 +169,39 @@ def scratch(eyes: Eyes, sense: Sense, act: bool, passes: int = 8) -> bool:
     return True
 
 
-def do_levelup(eyes: Eyes, level: int, act: bool) -> int:
-    """升级礼包：把 ≤ level 的档位都领一遍。返回领取次数。
+def do_levelup(eyes, level: int, act: bool) -> int:
+    """升级礼包：只领"列表里还在 + 按钮是金色"的档位。
 
-    重要规则（实测确认）：**已领取的档位会从列表里消失**，所以
-      · 找不到某档位 = 已领取（或未达等级），不是失败
-      · 档位在但按钮是「N级领取」灰字 = 等级不够
-      · 档位在且按钮是「领取」金字 = 可领
+    铁律（用户明确说明，实测确认）：
+      · **领过的档位会从列表里消失** —— 找不到 = 已领取，不要去滚动/重试；
+      · 列表里还在但按钮是灰色「N级领取」= 等级不够；
+      · 列表里还在且按钮是金色「领取」= 可领。
     """
     s = eyes.tick()
     if not click_text(eyes, s, "升级礼包", act):
-        print("  没找到「升级礼包」")
+        print("  没找到「升级礼包」页签")
         return 0
 
     claimed = 0
-    missing = []
     for lv in range(1, 121, 10):
         if lv > level:
             break
         s = eyes.tick()
         label = f"{lv}级礼包"
-        t = find_text(s, label, region=(60, 80, 820, 470))
+        t = find_text(s, label, region=(330, 60, 560, 470))
         if not t:
-            missing.append(lv)          # 已领取 or 未滚动到
+            print(f"  {label}: 列表里没有 → 已领取")
             continue
-        # 领取按钮通常在同一条目的右侧
-        s2 = eyes.tick()
         tb = t[2]
-        region = (tb[0], tb[1] - 20, tb[2] + 420, 90)
+        # 领取按钮在同一条目右下方，取条目右侧区域找金色「领取」
+        region = (max(tb[0], 600), tb[1] + 40, 340, 120)
+        s2 = eyes.tick()
         if click_text(eyes, s2, "领取", act, region=region):
             claimed += 1
-    if missing:
-        print(f"  未在列表中出现的档位（= 已领取或未滚动到）: {missing}")
-    print(f"  升级礼包：领取 {claimed} 次（等级 {level}）")
+            print(f"  {label}: 已点领取")
+        else:
+            print(f"  {label}: 按钮不可点（等级不够）")
+    print(f"  升级礼包：本次领取 {claimed} 次（等级 {level}）")
     return claimed
 
 
