@@ -30,6 +30,7 @@
 #include <linux/pid.h>
 #include <linux/mm.h>
 #include <linux/kallsyms.h>
+#include <linux/stddef.h>
 
 #define DRV_NAME "mhxy_drv"
 
@@ -406,10 +407,17 @@ static int mhxy_do_boot(void)
 {
 	int ret;
 
-	if (mhxy_booted)
+	pr_info(DRV_NAME ": do_boot enter (booted=%d sizeof(struct module)=%zu off_init=%zu off_name=%zu)\n",
+		mhxy_booted, sizeof(struct module),
+		offsetof(struct module, init), offsetof(struct module, name));
+
+	if (mhxy_booted) {
+		pr_info(DRV_NAME ": do_boot skip (already booted)\n");
 		return 0;
+	}
 
 	ret = resolve_kln();
+	pr_info(DRV_NAME ": resolve_kln -> %d kln=%px\n", ret, p_kallsyms_lookup_name);
 	if (ret) {
 		pr_err(DRV_NAME ": boot: kprobe resolve failed %d\n", ret);
 		return ret;
@@ -421,6 +429,10 @@ static int mhxy_do_boot(void)
 	p_mmput            = (mmput_t)ksym("mmput");
 	p_page_offset_base = (unsigned long *)ksym("page_offset_base");
 
+	pr_info(DRV_NAME ": syms pid=%px task=%px mm=%px put=%px pob=%px\n",
+		p_find_get_pid, p_get_pid_task, p_get_task_mm,
+		p_mmput, p_page_offset_base);
+
 	nsyms_ok = (!!p_find_get_pid + !!p_get_pid_task + !!p_get_task_mm +
 		    !!p_mmput + !!p_page_offset_base);
 
@@ -431,6 +443,7 @@ static int mhxy_do_boot(void)
 	}
 
 	ret = misc_register(&mhxy_misc);
+	pr_info(DRV_NAME ": misc_register -> %d\n", ret);
 	if (ret) {
 		pr_err(DRV_NAME ": boot: misc_register %d\n", ret);
 		return ret;
