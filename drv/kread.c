@@ -18,6 +18,13 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
+
+/* finit_module flags —— Android 的 toybox / busybox insmod 都不支持 -f */
+#ifndef MODULE_INIT_IGNORE_MODVERSIONS
+#define MODULE_INIT_IGNORE_MODVERSIONS 1
+#define MODULE_INIT_IGNORE_VERMAGIC    2
+#endif
 
 #define DEV "/dev/mhxy_drv"
 #define MHXY_MAGIC 'M'
@@ -104,6 +111,32 @@ static void hexdump(const uint8_t *b, size_t n, uint64_t base, int maxlines)
 	}
 }
 
+static int do_load(const char *path)
+{
+	int fd, err;
+	long r;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		printf("open %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	r = syscall(__NR_finit_module, fd, "",
+		    MODULE_INIT_IGNORE_MODVERSIONS | MODULE_INIT_IGNORE_VERMAGIC);
+	err = errno;
+	if (r) {
+		printf("finit_module(ignore vermagic+modversions): %s\n", strerror(err));
+		lseek(fd, 0, SEEK_SET);
+		errno = 0;
+		r = syscall(__NR_finit_module, fd, "", 0);
+		printf("finit_module(plain) -> %ld (%s)\n", r, strerror(errno));
+	} else {
+		printf("finit_module OK (vermagic + modversions ignored)\n");
+	}
+	close(fd);
+	return (int)r;
+}
+
 static int do_stat(void)
 {
 	struct mhxy_stat st;
@@ -160,11 +193,18 @@ int main(int argc, char **argv)
 	if (argc < 2) {
 		fprintf(stderr,
 			"usage:\n"
+			"  kread load <ko_path>            finit_module + ignore vermagic/modversions\n"
 			"  kread stat\n"
 			"  kread pgd  <pid|name> [probe_va]\n"
 			"  kread read <pid|name> <addr> <len>\n"
 			"  kread arena <pid|name>\n");
 		return 2;
+	}
+
+	/* load 必须在打开 /dev 之前处理（那时节点还不存在） */
+	if (!strcmp(argv[1], "load")) {
+		if (argc < 3) { fprintf(stderr, "missing ko path\n"); return 2; }
+		return do_load(argv[2]) ? 4 : 0;
 	}
 
 	g_fd = open(DEV, O_RDWR);
