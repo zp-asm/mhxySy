@@ -113,22 +113,50 @@ class Probes:
         self.panel_x = _load("panel_close")
         self.panel_x2 = _load("panel_close2")
 
+    @staticmethod
+    def bright_ratio(g) -> float:
+        """面板区域"亮像素"占比。面板底色米黄 → 灰度 ~190；主界面场景混合。
+
+        只用灰度，避免传错通道（之前 cvtColor(BGR2HSV) 在灰度图上直接崩）。
+        """
+        h, w = g.shape[:2]
+        roi = g[int(h*0.10):int(h*0.92), int(w*0.12):int(w*0.90)]
+        return float((roi > 175).mean())
+
     def panel_open(self, g) -> bool:
         """面板判定：必须面板本体 + ✕ 同时命中。
 
         只靠 ✕ 会误判（实测主界面 hero_close 误命中 0.911），
         那会让 tracker 永远以为面板开着而不动作。
         """
+        if self.bright_ratio(g) > 0.60:
+            return True         # 面板底色很亮 = 有面板（不依赖任何模板）
         if self.avatar is not None and _find(g, self.avatar, 0.85):
             return _find(g, self.hero_x, 0.88) is not None or _find(g, self.hero_x2, 0.88) is not None
         if self.header is not None and _find(g, self.header, 0.85):
-            return _find(g, self.panel_x, 0.88) is not None or _find(g, self.panel_x2, 0.88) is not None
+            return True        # 「任务」横幅命中就是任务面板（✕ 可能被红点/动画遮挡）
         return False
 
     def has_hud(self, g) -> bool:
         return _find(g, self.task, 0.85) is not None or _find(g, self.friend, 0.90) is not None
 
     def in_battle(self, g) -> bool:
+        """战斗判定：**右下角必须有「自动」按钮**（战斗独有），不放宽成"没有HUD"。
+
+        曾经用"有好友/没任务"判战斗，结果任务面板开着时误判 → battle 域乱点右下角。
+        """
+        if self.panel_open(g) or self.in_dialog(g):
+            return False
+        auto = getattr(self, "auto_btn", None)
+        if auto is None:
+            self.auto_btn = _load("battle_auto")
+            auto = self.auto_btn
+        if auto is not None:
+            h, w = g.shape
+            roi = g[int(h * 0.88):, int(w * 0.86):]      # 右下角 14% x 12%
+            hit = _find(roi, auto, 0.80)
+            if hit:
+                return True
         return _find(g, self.atk, 0.82) is not None and _find(g, self.skill, 0.82) is not None
 
     def in_dialog(self, g) -> bool:
@@ -146,6 +174,9 @@ def probes() -> Probes:
 
 
 # ---------------------------------------------------------------- 1 过场
+SKIP_ENABLED = True        # ▶▶ 跳过默认关闭：实测在面板/剧情上误命中，空点会堵死主线
+
+
 class SkipWorker(BaseWorker):
     name_, hz, gap = "skip", 6.0, 2.0
 
@@ -154,10 +185,13 @@ class SkipWorker(BaseWorker):
         # 只认"跳过"类按钮（右上 ▶▶）。**不含 cut_manual** —— 那是右下"手动"，
         # 位置在 (921,490)，点它等于逐句推进，实测会点错地方。
         self.tpls = [t for n in ("cut_ff3", "cut_ff2", "cut_ff") if (t := _load(n)) is not None]
+        self.marker = _load("cut_marker")     # 过场左上角图标（主界面没有）
         self.fixed = (920, 27)
         self.nohud_streak = 0
 
     def step(self) -> None:
+        if not SKIP_ENABLED:
+            return
         g = self.gray()
         if g is None:
             return
@@ -165,10 +199,14 @@ class SkipWorker(BaseWorker):
         if probes().panel_open(g):
             self.nohud_streak = 0
             return
-        if probes().has_hud(g):
+        # 必须是真过场：左上角要有过场图标行（主界面顶部是时间/地名，没有这排图标）
+        if self.marker is None or _find(g, self.marker, 0.85) is None:
             self.nohud_streak = 0
             return
-        # 战斗/对话界面同样没有 HUD，但它们有自己的域，skip 必须让开
+        # 面板/战斗/对话都不许"跳过"（它们会把任务按钮遮住，导致 has_hud 误判为 False）
+        if probes().panel_open(g) or probes().has_hud(g):
+            self.nohud_streak = 0
+            return
         if probes().in_battle(g) or probes().in_dialog(g):
             self.nohud_streak = 0
             return
@@ -198,10 +236,19 @@ class PopupWorker(BaseWorker):
         self.panel_closes = [t for n in ("panel_close", "panel_close2") if (t := _load(n)) is not None]
         self.popup_closes = [t for n in ("popup_close",) if (t := _load(n)) is not None]
         self.uses = [t for n in ("use_btn", "claim_btn", "popup_use") if (t := _load(n)) is not None]
+        self.confirm = _load("confirm_btn")
 
     def step(self) -> None:
         g = self.gray()
-        if g is None or not self.ready("p", self.gap):
+        if g is None or not self.ready("p", 0.8):
+            return
+        # ⓿ 二次确认弹窗（"是否跳过本段剧情？"）——必须最先点确认
+        if self.confirm is not None and _find(g, self.confirm, 0.85):
+            if self.ready("confirm", 1.2):
+                self.ex.push(0, 598, 380, "popup:confirm")
+                self.say("确认 (598,380)")
+            return
+        if not self.ready("p2", self.gap):
             return
         # 先点"使用/领取"（有奖励就先拿），没有再关窗
         for tpl in self.uses:
@@ -229,27 +276,59 @@ class PopupWorker(BaseWorker):
 
 # ---------------------------------------------------------------- 3 战斗域
 class BattleWorker(BaseWorker):
-    name_, hz, gap = "battle", 2.0, 2.5
+    """战斗域：点「自动」挂机。
+
+    自动按钮位置在各版本里基本固定（右下角 ~925,525），所以**先用固定坐标**，
+    不等模板；同时把进入战斗的第一帧存到 E:/out/battle_calib_*.png，
+    并自动裁出标准区域写进 templates/ —— 下次就有模板了。
+    """
+
+    name_, hz, gap = "battle", 2.0, 4.0
+    AUTO = (925, 525)
+    ATK = (930, 390)
+    TARGET = (245, 255)
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.auto = _load("battle_auto")
+        self.auto_tpl = _load("battle_auto")
+        self.saved = False
+        self.calib_dir = Path("calib")
 
     def step(self) -> None:
         g = self.gray()
-        if g is None or not probes().in_battle(g) or not self.ready("b", self.gap):
+        if g is None or not probes().in_battle(g):
+            self.saved = False
             return
-        hit = _find(g, self.auto, 0.85)
-        if hit:
-            self.ex.push(0, hit[0], hit[1], "battle:auto")
-            self.say(f"自动 ({hit[0]},{hit[1]})")
+        if not self.saved:
+            self._snapshot()
+            self.saved = True
+        if not self.ready("b", self.gap):
             return
-        atk = _find(g, probes().atk, 0.82)
-        if atk:
-            self.ex.push(5, atk[0], atk[1], "battle:attack")
-            time.sleep(0.3)
-            self.ex.push(5, 245, 255, "battle:target")
-            self.say("普攻 + 点目标")
+        hit = _find(g, self.auto_tpl, 0.85) if self.auto_tpl is not None else None
+        target = (hit[0], hit[1]) if hit else self.AUTO
+        self.ex.push(0, *target, "battle:auto")
+        self.say(f"自动 {target}{'' if hit else ' (固定坐标)'}")
+
+    def _snapshot(self) -> None:
+        """战斗第一帧：存原图 + 自动裁右侧竖排按钮/右下自动按钮。"""
+        try:
+            f = self.bgr()
+            if f is None:
+                return
+            self.calib_dir.mkdir(exist_ok=True)
+            import time as _t
+            tag = _t.strftime("%H%M%S")
+            cv2.imwrite(str(self.calib_dir / f"battle_{tag}.png"), f)
+            for name, box in (("battle_auto", (898, 500, 56, 40)),
+                              ("btn_attack", (900, 358, 56, 40)),
+                              ("btn_skill", (900, 190, 56, 40))):
+                x, y, w, h = box
+                crop = f[y:y + h, x:x + w]
+                if crop.size:
+                    cv2.imwrite(str(Path("templates") / f"{name}.png"), crop)
+            self.say("已自动采集战斗模板")
+        except Exception as e:
+            self.say(f"采集失败: {e}")
 
 
 # ---------------------------------------------------------------- 4 对话域
@@ -292,9 +371,9 @@ class TrackerWorker(BaseWorker):
     """
 
     name_, hz, gap = "tracker", 0.5, 3.0
-    TASK_BTN = (823, 96)
-    CHAPTER = (292, 129)          # 主线剧情下的第一条
-    ACTION = (756, 436)           # 详情页按钮（马上传送）
+    TASK_BTN = (825, 95)
+    CHAPTER = (290, 129)          # 主线剧情下的第一条
+    ACTION = (757, 425)           # 详情页按钮（马上传送）
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
