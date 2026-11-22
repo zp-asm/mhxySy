@@ -139,3 +139,49 @@ if __name__ == "__main__":
     out = crop_normalize(img, vp)
     cv2.imwrite("E:\\out\\viewport.png", out)
     print("normalized ->", out.shape, "saved E:\\out\\viewport.png")
+
+
+def align_by_anchors(frame: np.ndarray, locator, base_h: int = BASE_H,
+                     base_w: int = BASE_W, search: int = 24,
+                     tol: int = 6) -> tuple[Viewport, float, list[tuple[int, int, float]]]:
+    """多锚点联合对齐（我们自己的标定核心）。
+
+    为什么不能靠几何假设：
+        实例窗口 chrome 高度会变（实测一次是 40px，重开窗口后变 30px），
+        按"贴底"裁就会整体错位 10px，所有 UI 模板集体失配。
+    做法：
+        在 ±search 范围内枚举裁剪偏移 (dx,dy)，对每个锚点在**它自己的期望位置**附近
+        （±tol）取匹配分，求和；总分最高的偏移即为真实视口。
+    为什么不是退化的：
+        单个模板自由搜索时，滑动裁剪窗只是让命中坐标跟着平移、分数不变；
+        但这里每个锚点被约束在各自的期望坐标上，裁剪一错位，内容就落到别处，分数必掉。
+    """
+    h, w = frame.shape[:2]
+    best = ((0, max(0, h - base_h)), -1.0)
+    scores: list[tuple[int, int, float]] = []
+    for dy in range(-search, search + 1, 2):
+        for dx in range(-search, search + 1, 4):
+            y0 = h - base_h + dy
+            x0 = dx
+            if y0 < 0 or x0 < 0 or y0 + base_h > h or x0 + base_w > w:
+                continue
+            roi = frame[y0:y0 + base_h, x0:x0 + base_w]
+            g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            total, cnt = 0.0, 0
+            for name, (tpl, box, thresh, pad) in locator.items.items():
+                bx, by, bw, bh = box
+                rx0 = max(0, bx - tol); ry0 = max(0, by - tol)
+                rx1 = min(base_w, bx + bw + tol); ry1 = min(base_h, by + bh + tol)
+                sub = g[ry0:ry1, rx0:rx1]
+                if sub.shape[0] < tpl.shape[0] or sub.shape[1] < tpl.shape[1]:
+                    continue
+                res = cv2.matchTemplate(sub, tpl, cv2.TM_CCOEFF_NORMED)
+                total += float(res.max()); cnt += 1
+            if cnt:
+                avg = total / cnt
+                scores.append((dx, y0, avg))
+                if avg > best[1]:
+                    best = ((x0, y0), avg)
+    (x0, y0), score = best
+    scores.sort(key=lambda t: -t[2])
+    return Viewport(x=x0, y=y0, w=base_w, h=base_h, src_w=w, src_h=h), score, scores[:5]
