@@ -48,12 +48,43 @@ def enable_actions(flag: bool = True) -> None:
 # 锚点清单：名字 -> (默认阈值, 默认 ROI 外扩)
 # 任务面板锚点（面板打开时才用；优先级高于主界面锚点）
 PANEL_ANCHORS: dict[str, tuple[float, int]] = {
-    "panel_close":    (0.90, 20),
-    "panel_teleport": (0.90, 24),
-    "panel_tab_main": (0.88, 20),
-    "panel_title":    (0.85, 12),
-    "panel_goal":     (0.80, 12),
-    "panel_desc":     (0.75, 12),
+    "top_map":     (0.85, 30),
+    "mall_btn":    (0.88, 30),
+    "event_btn":   (0.88, 30),
+    "task_btn":    (0.90, 40),
+    "team_btn":    (0.90, 40),
+    "quest_track": (0.88, 16),
+    "bag_btn":     (0.90, 36),
+    "friend_btn":  (0.88, 36),
+}
+
+# 剧情过场（黑屏 + 字幕 + 手动/快进）
+CUTSCENE_ANCHORS: dict[str, tuple[float, int]] = {
+    "cut_manual":   (0.85, 20),
+    "cut_ff":       (0.85, 16),
+    "cut_skip":     (0.85, 16),
+    "cut_subtitle": (0.72, 8),
+}
+
+# NPC 对话（右下「自动」+ 右上 ▶▶ + 说话人铭牌 + 正文）
+DIALOG_ANCHORS: dict[str, tuple[float, int]] = {
+    "dlg_auto":    (0.88, 20),
+    "dlg_ff":      (0.85, 16),
+    "dlg_speaker": (0.85, 16),
+    "dlg_text":    (0.70, 8),
+}
+
+# 弹窗（新手礼包等）：出现就点「使用」，没使用就点 ✕
+POPUP_ANCHORS: dict[str, tuple[float, int]] = {
+    "popup_use":   (0.85, 20),
+    "popup_close": (0.86, 20),
+    "popup_title": (0.82, 16),
+}
+
+# 人物属性面板（✕ + 头像）
+HERO_ANCHORS: dict[str, tuple[float, int]] = {
+    "hero_close":  (0.88, 20),
+    "hero_avatar": (0.85, 30),
 }
 
 # 这 4 个是在"面板打开"的帧里采的，纹理其实是面板边缘 → 面板关闭后必须重采
@@ -104,10 +135,19 @@ class Sense:
 
     @property
     def state(self) -> str:
+        # 过场优先：黑屏字幕的状态下别的锚点都会失效
+        if self.has("popup_use") or self.has("popup_close"):
+            return "POPUP"
+        if self.has("hero_close"):
+            return "HERO_PANEL"
+        if self.has("cut_manual") and self.has("cut_ff"):
+            return "CUTSCENE"
+        if self.has("dlg_auto") or (self.has("dlg_speaker") and self.has("dlg_ff")):
+            return "DIALOG"
         # 面板优先：面板打开时右侧按钮全被遮住，主界面锚点不可信
-        if self.has("panel_teleport") and self.has("panel_close"):
+        if any(k in self.hits for k in ("panel_close", "panel_close2", "panel_header")):
             return "TASK_PANEL"
-        if self.has("task_btn") and self.has("quest_track"):
+        if self.has("task_btn"):
             return "MAIN_UI"
         return "UNKNOWN"
 
@@ -129,6 +169,10 @@ class Locator:
         self.items: dict[str, tuple[np.ndarray, tuple[int, int, int, int], float, int]] = {}
         merged = dict(ANCHORS)
         merged.update(PANEL_ANCHORS)
+        merged.update(CUTSCENE_ANCHORS)
+        merged.update(DIALOG_ANCHORS)
+        merged.update(POPUP_ANCHORS)
+        merged.update(HERO_ANCHORS)
         for name, (thresh, pad) in merged.items():
             png = self.dir / f"{name}.png"
             if not png.exists():
@@ -259,6 +303,83 @@ def read_panel(sense: Sense) -> dict[str, str]:
     return out
 
 
+def popup_use(sense: Sense) -> float:
+    """点弹窗的「使用」（新手礼包等）。"""
+    hit = sense.hits.get("popup_use") or sense.hits.get("popup_close")
+    if not hit:
+        raise RuntimeError("没有弹窗")
+    cx, cy = hit.center
+    return adb_tap(cx, cy)
+
+
+def dialog_auto(sense: Sense) -> float:
+    """点右下「自动」，让 NPC 对白自动推进（挂机首选）。"""
+    hit = sense.hits.get("dlg_auto")
+    if not hit:
+        raise RuntimeError("不在对话界面")
+    cx, cy = hit.center
+    return adb_tap(cx, cy)
+
+
+def dialog_advance(sense: Sense) -> float:
+    """点右上 ▶▶ 快进/推进对白。"""
+    hit = sense.hits.get("dlg_ff")
+    if not hit:
+        raise RuntimeError("找不到快进按钮")
+    cx, cy = hit.center
+    return adb_tap(cx, cy)
+
+
+def cutscene_next(sense: Sense, use_ff: bool = True) -> float:
+    """推进剧情：优先点右上快进 ▶▶，没有就点右下「手动」。"""
+    key = "cut_ff" if use_ff and "cut_ff" in sense.hits else "cut_manual"
+    hit = sense.hits.get(key)
+    if not hit:
+        raise RuntimeError("不在剧情过场里")
+    cx, cy = hit.center
+    return adb_tap(cx, cy)
+
+
+def find_text(sense: Sense, needle: str, region: tuple[int, int, int, int] | None = None,
+              scale: float = 2.0) -> tuple[int, int, tuple[int, int, int, int]] | None:
+    """在画面里 OCR 找一段文字，返回 (中心x, 中心y, bbox)。用于面板这种"位置随页签漂移"的 UI。"""
+    x0, y0, x1, y1 = region or (60, 20, 900, 500)
+    crop = sense.base[y0:y1, x0:x1]
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        big = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        out = RapidOCR()(big)
+    except Exception:
+        return None
+    if not out or not out[0]:
+        return None
+    for box, txt, score in out[0]:
+        if needle in txt:
+            xs = [p[0] / scale + x0 for p in box]
+            ys = [p[1] / scale + y0 for p in box]
+            bx, by = int(min(xs)), int(min(ys))
+            bw, bh = int(max(xs) - min(xs)), int(max(ys) - min(ys))
+            return (bx + bw // 2, by + bh // 2, (bx, by, bw, bh))
+    return None
+
+
+def click_text(sense: Sense, needle: str, region=None) -> tuple[float, tuple[int, int]]:
+    hit = find_text(sense, needle, region)
+    if not hit:
+        raise RuntimeError(f"画面里找不到文字: {needle}")
+    cx, cy, _ = hit
+    return adb_tap(cx, cy), (cx, cy)
+
+
+def panel_goto_main(sense: Sense) -> float:
+    """点「主线剧情(1)」页签 —— 面板可能停在 导引/日常 等其它页。"""
+    hit = sense.hits.get("panel_tab_main")
+    if not hit:
+        raise RuntimeError("找不到「主线剧情」页签")
+    cx, cy = hit.center
+    return adb_tap(cx, cy)
+
+
 def panel_teleport(sense: Sense) -> float:
     """点任务面板的「马上传送」（主线推进的主力动作）。"""
     hit = sense.hits.get("panel_teleport")
@@ -312,6 +433,16 @@ def main(argv: list[str]) -> int:
         print("after :", s2.state)
         print("  ", s2.summary())
         cv2.imwrite("E:/out/after_open_task.png", s2.base)
+        return 0
+
+    if cmd == "next":
+        s = eyes.tick()
+        if s.state != "CUTSCENE":
+            print(f"  当前状态 {s.state}，不是剧情过场")
+            return 2
+        cx, cy = (s.hits["cut_ff"] if "cut_ff" in s.hits else s.hits["cut_manual"]).center
+        cost = cutscene_next(s)
+        print(f"  tap({cx},{cy})  推进剧情  {cost:.0f} ms")
         return 0
 
     if cmd == "teleport":
