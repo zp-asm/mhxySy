@@ -376,6 +376,10 @@ static struct miscdevice mhxy_misc = {
 /* ------------------------------------------------------------------ */
 /* 潜伏：摘模块链表（/proc/modules、kallsyms 的模块遍历都靠它）          */
 /* ------------------------------------------------------------------ */
+static bool hide;
+module_param(hide, bool, 0600);
+MODULE_PARM_DESC(hide, "unlink module from /proc/modules after init (rmmod then stops working)");
+
 static void hide_self(void)
 {
 	__module_get(THIS_MODULE);
@@ -415,6 +419,11 @@ static int __init mhxy_init(void)
 	}
 
 	pr_info(DRV_NAME ": ready, page_offset_base=0x%lx\n", *p_page_offset_base);
+
+	if (hide) {
+		hide_self();
+		pr_info(DRV_NAME ": hidden from /proc/modules (rmmod disabled)\n");
+	}
 	return 0;
 }
 

@@ -7,7 +7,8 @@ ARCH ?= x86_64
 CROSS_COMPILE ?=
 
 # 这个模块只用导出符号 + 页表常量，不需要 MuMu 的私有头文件
-ccflags-y += -Wno-unused-variable
+# -Wno-error：6.1 的 -Werror=unused-function 之类会把小警告变硬错误，这里兜底
+ccflags-y += -Wno-unused-variable -Wno-error
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
