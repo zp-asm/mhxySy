@@ -386,14 +386,32 @@ static void hide_self(void)
 	list_del(&THIS_MODULE->list);
 }
 
+static void __exit mhxy_exit(void)
+{
+	misc_deregister(&mhxy_misc);
+}
+
 /* ------------------------------------------------------------------ */
-static int __init mhxy_init(void)
+/* 后备入口：不依赖 mod->init                                          */
+/*                                                                     */
+/* MuMu 的 6.1.90-perf+ 是定制内核，struct module 布局与 vanilla 不同，  */
+/* 内核按自己的偏移读 mod->init 会读到 NULL（表现为"加载成功但啥也没干"）。*/
+/* 但 mod_sysfs_setup() 在 do_one_initcall 之前执行，module param 的     */
+/* setter 一定注册成功 —— 所以给一个 param，写它就能触发初始化。          */
+/*   echo 1 > /sys/module/mhxy_drv/parameters/go                        */
+/* ------------------------------------------------------------------ */
+static int mhxy_booted;
+
+static int mhxy_do_boot(void)
 {
 	int ret;
 
+	if (mhxy_booted)
+		return 0;
+
 	ret = resolve_kln();
 	if (ret) {
-		pr_err(DRV_NAME ": kprobe resolve failed %d\n", ret);
+		pr_err(DRV_NAME ": boot: kprobe resolve failed %d\n", ret);
 		return ret;
 	}
 
@@ -408,17 +426,18 @@ static int __init mhxy_init(void)
 
 	if (!p_find_get_pid || !p_get_pid_task || !p_get_task_mm ||
 	    !p_mmput || !p_page_offset_base) {
-		pr_err(DRV_NAME ": symbols incomplete (%u/5)\n", nsyms_ok);
+		pr_err(DRV_NAME ": boot: symbols incomplete (%u/5)\n", nsyms_ok);
 		return -ENOENT;
 	}
 
 	ret = misc_register(&mhxy_misc);
 	if (ret) {
-		pr_err(DRV_NAME ": misc_register %d\n", ret);
+		pr_err(DRV_NAME ": boot: misc_register %d\n", ret);
 		return ret;
 	}
 
-	pr_info(DRV_NAME ": ready, page_offset_base=0x%lx\n", *p_page_offset_base);
+	pr_info(DRV_NAME ": boot ok, page_offset_base=0x%lx\n", *p_page_offset_base);
+	mhxy_booted = 1;
 
 	if (hide) {
 		hide_self();
@@ -427,13 +446,32 @@ static int __init mhxy_init(void)
 	return 0;
 }
 
-static void __exit mhxy_exit(void)
+static int go_set(const char *val, const struct kernel_param *kp)
 {
-	misc_deregister(&mhxy_misc);
+	int ret;
+
+	pr_info(DRV_NAME ": go_set called (val=%s)\n", val ? val : "(null)");
+	ret = mhxy_do_boot();
+	pr_info(DRV_NAME ": go_set -> %d\n", ret);
+	return ret;
+}
+
+static const struct kernel_param_ops go_ops = {
+	.set = go_set,
+};
+
+module_param_cb(go, &go_ops, NULL, 0600);
+MODULE_PARM_DESC(go, "write 1 to trigger driver init (bypasses mod->init layout issue)");
+
+/* 正常路径：如果内核布局恰好一致，init 会先跑（幂等） */
+static int __init mhxy_init(void)
+{
+	return mhxy_do_boot();
 }
 
 module_init(mhxy_init);
 module_exit(mhxy_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("PTE-walk cross-process memory reader (research)");
-MODULE_VERSION("0.2");
+MODULE_VERSION("0.3");
+
