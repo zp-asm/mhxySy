@@ -74,11 +74,39 @@ def open_welfare(eyes: Eyes, act: bool) -> bool:
     return True
 
 
-LEVEL_ROI = (246, 56, 120, 40)      # 人物属性面板上「3级」的位置（960x540 基准）
+LEVEL_BADGE_ROI = (840, 40, 90, 60)   # 头像左下角「红框等级角标」（960x540 基准，实测 OCR 1.00）
+LEVEL_ROI = (246, 56, 120, 40)        # 兜底：人物属性面板上的「N级」
+
+
+def read_level_badge(eyes: Eyes) -> int | None:
+    """读头像旁的红框等级角标 —— 不开面板、不打断流程，实测 OCR 置信度 1.00。"""
+    s = eyes.tick()
+    x, y, w, h = LEVEL_BADGE_ROI
+    crop = s.base[y:y + h, x:x + w]
+    if crop.size == 0:
+        return None
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        big = cv2.resize(crop, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
+        out = RapidOCR()(big)
+    except Exception:
+        return None
+    if not out or not out[0]:
+        return None
+    for _box, txt, score in out[0]:
+        digits = "".join(ch for ch in txt if ch.isdigit())
+        if digits and float(score) > 0.5:
+            return int(digits)
+    return None
 
 
 def read_level(eyes: Eyes, act: bool) -> int | None:
     """读等级：OCR「N级」。当前界面若没有，就先点头像开人物属性。"""
+    # 首选：头像旁红框角标（不需要开面板）
+    lv = read_level_badge(eyes)
+    if lv is not None:
+        return lv
+
     s = eyes.tick()
     t = find_text(s, "级", region=LEVEL_ROI)
     if not t:
