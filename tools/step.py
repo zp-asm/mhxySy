@@ -60,6 +60,10 @@ def do_next(eyes: Eyes, act: bool) -> str:
             r = tap(k, lb)
             if r:
                 return r
+        # 模板追不完各版本的 ▶▶ 图标 → 右上角固定坐标兜底
+        if act:
+            adb_tap(920, 27)
+        return f"跳过剧情(▶▶ 固定坐标 920,27){'' if act else '  [dry]'}"
 
     if s.state == "DIALOG":
         r = tap("dlg_auto", "对话-自动")

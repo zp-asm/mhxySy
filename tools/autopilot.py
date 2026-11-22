@@ -139,11 +139,19 @@ class Pilot:
                     self.stats["popup"] += 1
                     return st
 
-        # ---- CUTSCENE：优先跳过（右上 ▶▶），没有再逐句手动
+        # ---- CUTSCENE：跳过。模板追不完各版本的 ▶▶ 图标，最后用固定坐标兜底
         if st == "CUTSCENE":
-            if self.tap_hit(s, "cut_ff2", "skip", 2.0) or self.tap_hit(s, "cut_ff", "skip", 2.0):
-                self.stats["cut"] += 1
-            elif self.tap_hit(s, "cut_manual", "cut-manual", 1.2):
+            hit_any = False
+            for k in ("cut_ff2", "cut_ff", "cut_manual"):
+                if self.tap_hit(s, k, "skip", 2.2):
+                    hit_any = True
+                    break
+            if not hit_any and self.ready("skip-fixed", 2.2):
+                if self.act:
+                    adb_tap(930, 27)          # 右上角 ▶▶ 的固定位置
+                log(f"skip: 固定坐标 (930,27){'' if self.act else '  [dry]'}")
+                hit_any = True
+            if hit_any:
                 self.stats["cut"] += 1
             return st
 

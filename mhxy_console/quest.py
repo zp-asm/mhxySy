@@ -148,6 +148,11 @@ class Sense:
         return float((self.base.max(axis=2) > 8).mean())
 
     @property
+    def is_black_screen(self) -> bool:
+        """整屏近黑（切场景/加载）：这种别乱点。"""
+        return self.dark_ratio < 0.05
+
+    @property
     def is_dark(self) -> bool:
         return self.dark_ratio < 0.35
 
@@ -160,9 +165,14 @@ class Sense:
             return "BATTLE"
         if self.has("hero_close") or self.has("hero_close2"):
             return "HERO_PANEL"
-        # 过场必须"暗"：右上角 ▶▶ 模板在主界面头像区也会误命中，光靠模板会把主界面当过场，
-        # 一按就按到头像 → 打开人物属性（实测踩过 17 次循环）。
-        if self.is_dark and (self.has("cut_ff") or self.has("cut_ff2") or self.has("cut_manual")):
+        # 过场判据（两次踩坑后的最终版）：
+        #   ① 有 ▶▶/手动 之类的过场按钮
+        #   ② 且 **没有 HUD**（任务/好友/包裹/队伍 都不在）—— 主界面右上角头像区会误命中 ▶▶ 模板
+        #   ③ 或者画面很暗（黑屏过场）
+        # 过场/剧情的最终判据：**没有 HUD**（主界面必然有 任务/好友/包裹/队伍 按钮）。
+        # 不再依赖 ▶▶ 模板 —— 每个版本的 ▶▶ 图标长得都不一样，模板永远追不完。
+        has_hud = any(self.has(k) for k in ("task_btn", "friend_btn", "bag_btn", "team_btn"))
+        if not has_hud and not self.is_black_screen:
             return "CUTSCENE"
         # 真对话必须有说话人铭牌；主界面右下也有「自动」按钮，光看它会误判
         if self.has("dlg_speaker"):
