@@ -1,20 +1,23 @@
-"""六路 worker：一个线程只干一件事，互不阻塞，共用一个点击出口。
+"""单一职责 worker 集 —— 一个线程只做一件事。
 
-    Capture          8 Hz 抓帧（只留最新帧，不排队）
-    Executor         唯一点击出口（优先级 0 中断 / 5 主线；>1.5s 过期丢弃）
+原则（用户要求，也是踩坑结论）：
+    · 不解析任务文本，只认界面类型；
+    · 每个 worker 只负责**一个动作**（跳过 / 关闭 / 使用 / 领取 / 自动 / 普攻 / 对话 / 选项 / 追踪 / 血蓝 / 等级）；
+    · 所有点击只经 Executor 一个出口，优先级 0=中断 5=主线；
+    · 任何 worker 崩了不影响其它 worker。
 
-    SkipWorker       ▶▶ 跳过剧情        —— 只在"没有 HUD"时动作（防误点头像）
-    PanelCloseWorker ✕ 关闭面板         —— 人物属性/福利/任务面板…
-    PopupUseWorker   使用 / 领取        —— 弹窗里的可点按钮
-    BattleWorker     攻击 + 点目标      —— 战斗中
-    MonitorWorker    HP / MP / 等级     —— 只读，不动手
-    QuestWorker      追踪条 / 任务面板  —— 主线推进
-
-为什么必须拆（都是实测踩出来的）：
-    ① 主线一次 OCR 0.5~1.5 s，期间弹窗/过场全漏；
-    ② 多线程各自 adb_tap 会互相插队 → 点击统一走 Executor；
-    ③ ▶▶ 模板在主界面头像区也会命中 → SkipWorker 必须有 HUD 门控，
-       否则\"点头像开面板 → 关面板\"死循环（实测 40 次）。
+线程清单（11 个，全部无状态或只存自身阈值状态）：
+    skip         ▶▶ 跳过过场（仅无 HUD 时）
+    close        ✕ 关闭面板
+    use          使用（道具/礼包）
+    claim        领取（任务/活动奖励）
+    battle_auto  战斗 → 点「自动」
+    battle_atk   战斗 → 普攻 + 点目标（无自动按钮时兜底）
+    dialog_auto  对话 → 点「自动」
+    dialog_opt   对话 → 点选项
+    tracker      主线 → 点追踪条（游戏自己寻路）
+    hpmp         血/蓝条变化（只读）
+    level        等级角标（只读 OCR）
 """
 from __future__ import annotations
 
@@ -48,8 +51,11 @@ def _find(g: np.ndarray, tpl: np.ndarray | None, th: float) -> tuple[int, int, f
 
 
 class BaseWorker(threading.Thread):
+    """只提供节拍 + 帧 + 冷却 + 日志；不含任何业务判断。"""
+
     name_ = "base"
     hz = 5.0
+    gap = 2.0
 
     def __init__(self, cap: Capture, ex: Executor):
         super().__init__(daemon=True, name=self.name_)
@@ -57,26 +63,32 @@ class BaseWorker(threading.Thread):
         self.interval = 1.0 / self.hz
         self.running = True
         self.log: list[str] = []
-        self.cool: dict[str, float] = {}
+        self._last = 0.0
 
     def say(self, msg: str) -> None:
-        line = f"[{time.strftime('%H:%M:%S')}] {self.name_:6s} {msg}"
+        line = f"[{time.strftime('%H:%M:%S')}] {self.name_:11s} {msg}"
         self.log.append(line)
         print(line, flush=True)
 
-    def frame(self) -> np.ndarray | None:
+    def frame_gray(self) -> np.ndarray | None:
+        f, stamp = self.cap.get()
+        if f is None or time.time() - stamp > 1.2:
+            return None
+        crop = f[40:580, :] if f.shape[0] > 540 else f
+        return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    def frame_bgr(self):
         f, stamp = self.cap.get()
         if f is None or time.time() - stamp > 1.2:
             return None
         return f[40:580, :] if f.shape[0] > 540 else f
 
-    def ready(self, key: str, gap: float) -> bool:
-        if time.time() - self.cool.get(key, 0) < gap:
+    def cooled(self) -> bool:
+        if time.time() - self._last < self.gap:
             return False
-        self.cool[key] = time.time()
+        self._last = time.time()
         return True
 
-    # ---- 子类实现 step()；loop() 负责节拍与异常兜底
     def step(self) -> None:
         raise NotImplementedError
 
@@ -85,138 +97,235 @@ class BaseWorker(threading.Thread):
             t0 = time.time()
             try:
                 self.step()
-            except Exception as e:          # 单个 worker 崩了不影响别人
+            except Exception as e:
                 self.say(f"错误: {e}")
             dt = self.interval - (time.time() - t0)
             if dt > 0:
                 time.sleep(dt)
 
 
-class HudProbe:
-    """\"有没有 HUD\"：主界面必有任务/好友按钮。"""
-
+# ---------------------------------------------------------------- 共用探测
+class Probes:
     def __init__(self):
-        self.tpls = [t for n in ("task_btn", "friend_btn") if (t := _load(n)) is not None]
+        self.task = _load("task_btn")
+        self.friend = _load("friend_btn")
+        self.atk = _load("btn_attack")
+        self.skill = _load("btn_skill")
+        self.speaker = _load("dlg_speaker")
 
-    def has_hud(self, g: np.ndarray) -> bool:
-        return any(_find(g, t, 0.90) is not None for t in self.tpls)
+    def has_hud(self, g) -> bool:
+        return _find(g, self.task, 0.90) is not None or _find(g, self.friend, 0.90) is not None
+
+    def in_battle(self, g) -> bool:
+        return _find(g, self.atk, 0.82) is not None and _find(g, self.skill, 0.82) is not None
+
+    def in_dialog(self, g) -> bool:
+        return _find(g, self.speaker, 0.85) is not None
 
 
-# ---------------------------------------------------------------- 1 剧情跳过
+PROBES: Probes | None = None
+
+
+def probes() -> Probes:
+    global PROBES
+    if PROBES is None:
+        PROBES = Probes()
+    return PROBES
+
+
+# ---------------------------------------------------------------- 1 跳过过场
 class SkipWorker(BaseWorker):
-    name_, hz = "skip", 6.0
+    name_, hz, gap = "skip", 6.0, 2.0
 
-    def __init__(self, cap, ex, hud: HudProbe):
+    def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.hud = hud
         self.tpls = [t for n in ("cut_ff2", "cut_ff", "cut_manual") if (t := _load(n)) is not None]
         self.fixed = (920, 27)
-        self.count = 0
 
     def step(self) -> None:
-        f = self.frame()
-        if f is None:
+        g = self.frame_gray()
+        if g is None or probes().has_hud(g) or not self.cooled():
             return
-        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-        if self.hud.has_hud(g):
-            return                                  # 主界面绝不点
         for tpl in self.tpls:
             hit = _find(g, tpl, 0.85)
-            if hit and self.ready("skip", 2.0):
+            if hit:
                 self.ex.push(0, hit[0], hit[1], "skip")
-                self.count += 1
-                self.say(f"▶▶ 跳过 {hit[2]:.2f} ({hit[0]},{hit[1]})")
+                self.say(f"▶▶ ({hit[0]},{hit[1]})")
                 return
-        if self.ready("skip-fixed", 2.0):
-            self.ex.push(0, *self.fixed, "skip-fixed")
-            self.count += 1
-            self.say(f"▶▶ 跳过(固定坐标) {self.fixed}")
+        self.ex.push(0, *self.fixed, "skip")
+        self.say(f"▶▶ 固定坐标 {self.fixed}")
 
 
-# ---------------------------------------------------------------- 2 面板关闭
-class PanelCloseWorker(BaseWorker):
-    name_, hz = "close", 5.0
+# ---------------------------------------------------------------- 2 关闭面板
+class CloseWorker(BaseWorker):
+    name_, hz, gap = "close", 5.0, 2.5
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
         self.tpls = [t for n in ("hero_close2", "hero_close", "panel_close", "panel_close2")
                      if (t := _load(n)) is not None]
-        self.count = 0
 
     def step(self) -> None:
-        f = self.frame()
-        if f is None:
+        g = self.frame_gray()
+        if g is None or not self.cooled():
             return
-        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
         for tpl in self.tpls:
             hit = _find(g, tpl, 0.88)
-            if hit and self.ready("close", 2.5):
+            if hit:
                 self.ex.push(0, hit[0], hit[1], "close")
-                self.count += 1
-                self.say(f"✕ 关面板 {hit[2]:.2f} ({hit[0]},{hit[1]})")
+                self.say(f"✕ ({hit[0]},{hit[1]})")
                 return
 
 
-# ---------------------------------------------------------------- 3 弹窗使用
-class PopupUseWorker(BaseWorker):
-    name_, hz = "use", 5.0
+# ---------------------------------------------------------------- 3 使用
+class UseWorker(BaseWorker):
+    name_, hz, gap = "use", 5.0, 2.0
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.tpls = [t for n in ("use_btn", "claim_btn", "popup_use") if (t := _load(n)) is not None]
-        self.count = 0
+        self.tpls = [t for n in ("use_btn", "popup_use") if (t := _load(n)) is not None]
 
     def step(self) -> None:
-        f = self.frame()
-        if f is None:
+        g = self.frame_gray()
+        if g is None or not self.cooled():
             return
-        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
         for tpl in self.tpls:
             hit = _find(g, tpl, 0.86)
-            if hit and self.ready("use", 2.0):
+            if hit:
                 self.ex.push(0, hit[0], hit[1], "use")
-                self.count += 1
-                self.say(f"使用/领取 {hit[2]:.2f} ({hit[0]},{hit[1]})")
+                self.say(f"使用 ({hit[0]},{hit[1]})")
                 return
 
 
-# ---------------------------------------------------------------- 4 战斗
-class BattleWorker(BaseWorker):
-    name_, hz = "battle", 2.0
+# ---------------------------------------------------------------- 4 领取
+class ClaimWorker(BaseWorker):
+    name_, hz, gap = "claim", 5.0, 2.5
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.atk = _load("btn_attack")
-        self.skill = _load("btn_skill")
-        self.count = 0
+        self.tpl = _load("claim_btn")
 
     def step(self) -> None:
-        f = self.frame()
-        if f is None:
+        g = self.frame_gray()
+        if g is None or not self.cooled():
             return
-        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-        a = _find(g, self.atk, 0.85)
-        s = _find(g, self.skill, 0.85)
-        if not (a and s):
-            return
-        if self.ready("battle", 2.0):
-            self.ex.push(5, a[0], a[1], "battle:attack")
-            time.sleep(0.4)
-            self.ex.push(5, 245, 255, "battle:target")
-            self.count += 1
-            self.say("攻击 + 点目标")
+        hit = _find(g, self.tpl, 0.86)
+        if hit:
+            self.ex.push(0, hit[0], hit[1], "claim")
+            self.say(f"领取 ({hit[0]},{hit[1]})")
 
 
-# ---------------------------------------------------------------- 5 监控
-class MonitorWorker(BaseWorker):
-    name_, hz = "monitor", 1.0
-    HP_ROI = (824, 2, 62, 12)        # 5x 放大实测
-    MP_ROI = (824, 14, 62, 12)
-    LV_ROI = (846, 38, 42, 26)
+# ---------------------------------------------------------------- 5 战斗→自动
+class BattleAutoWorker(BaseWorker):
+    name_, hz, gap = "battle_auto", 2.0, 6.0
 
     def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.hp = self.mp = self.level = None
+        self.auto = _load("battle_auto")
+
+    def step(self) -> None:
+        g = self.frame_gray()
+        if g is None or not probes().in_battle(g) or not self.cooled():
+            return
+        hit = _find(g, self.auto, 0.85)
+        if hit:
+            self.ex.push(0, hit[0], hit[1], "battle:auto")
+            self.say(f"点自动 ({hit[0]},{hit[1]})")
+
+
+# ---------------------------------------------------------------- 6 战斗→普攻
+class BattleAttackWorker(BaseWorker):
+    name_, hz, gap = "battle_atk", 2.0, 2.2
+
+    def __init__(self, cap, ex):
+        super().__init__(cap, ex)
+        self.auto = _load("battle_auto")
+
+    def step(self) -> None:
+        g = self.frame_gray()
+        if g is None or not probes().in_battle(g) or not self.cooled():
+            return
+        if _find(g, self.auto, 0.85):
+            return                       # 有自动按钮就交给 battle_auto
+        atk = _find(g, probes().atk, 0.82)
+        if atk:
+            self.ex.push(5, atk[0], atk[1], "battle:attack")
+            time.sleep(0.3)
+            self.ex.push(5, 245, 255, "battle:target")
+            self.say("普攻 + 点目标")
+
+
+# ---------------------------------------------------------------- 7 对话→自动
+class DialogAutoWorker(BaseWorker):
+    name_, hz, gap = "dialog_auto", 3.0, 8.0
+
+    def __init__(self, cap, ex):
+        super().__init__(cap, ex)
+        self.auto = _load("dlg_auto")
+
+    def step(self) -> None:
+        g = self.frame_gray()
+        if g is None or not probes().in_dialog(g) or not self.cooled():
+            return
+        hit = _find(g, self.auto, 0.85)
+        if hit:
+            self.ex.push(0, hit[0], hit[1], "dialog:auto")
+            self.say(f"点自动 ({hit[0]},{hit[1]})")
+
+
+# ---------------------------------------------------------------- 8 对话→选项
+class DialogOptionWorker(BaseWorker):
+    name_, hz, gap = "dialog_opt", 3.0, 2.5
+
+    def __init__(self, cap, ex):
+        super().__init__(cap, ex)
+        self.opt = _load("dialog_option")
+        self.fixed = (790, 356)
+
+    def step(self) -> None:
+        g = self.frame_gray()
+        if g is None or not probes().in_dialog(g) or not self.cooled():
+            return
+        hit = _find(g, self.opt, 0.85)
+        if hit:
+            self.ex.push(5, hit[0], hit[1], "dialog:option")
+            self.say(f"点选项 ({hit[0]},{hit[1]})")
+        else:
+            self.ex.push(5, *self.fixed, "dialog:option")
+            self.say(f"点选项(固定) {self.fixed}")
+
+
+# ---------------------------------------------------------------- 9 主线→追踪条
+class TrackerWorker(BaseWorker):
+    name_, hz, gap = "tracker", 0.2, 8.0
+
+    def __init__(self, cap, ex):
+        super().__init__(cap, ex)
+        self.track = _load("quest_track")
+
+    def step(self) -> None:
+        g = self.frame_gray()
+        if g is None or not self.cooled():
+            return
+        if _find(g, probes().task, 0.90) is None:
+            return
+        if probes().in_battle(g) or probes().in_dialog(g):
+            return
+        hit = _find(g, self.track, 0.85)
+        target = (hit[0], hit[1] + 30) if hit else (855, 180)
+        self.ex.push(5, *target, "tracker")
+        self.say(f"点追踪条 {target}")
+
+
+# ---------------------------------------------------------------- 10 血蓝监控
+class HpMpWorker(BaseWorker):
+    name_, hz, gap = "hpmp", 1.0, 0.0
+    HP_ROI = (824, 2, 62, 12)
+    MP_ROI = (824, 14, 62, 12)
+
+    def __init__(self, cap, ex):
+        super().__init__(cap, ex)
+        self.hp = self.mp = None
         self.events: list[str] = []
 
     @staticmethod
@@ -230,7 +339,7 @@ class MonitorWorker(BaseWorker):
         return float(cols.max() + 1) / w if cols.size else 0.0
 
     def step(self) -> None:
-        f = self.frame()
+        f = self.frame_bgr()
         if f is None:
             return
         hp = self._bar(f, self.HP_ROI, (0, 90, 90), (12, 255, 255))
@@ -240,72 +349,54 @@ class MonitorWorker(BaseWorker):
             self.say(f"HP {hp:.0%}")
             if hp < 0.3:
                 self.events.append(f"LOW_HP {hp:.0%}")
-                self.say("⚠ 血量低")
         if mp is not None and (self.mp is None or abs(mp - self.mp) > 0.05):
             self.mp = mp
             self.say(f"MP {mp:.0%}")
-        if self.ready("lv", 20.0):
-            lv = _ocr_level(f, self.LV_ROI)
-            if lv and lv != self.level:
-                self.say(f"LV {self.level} -> {lv}")
-                self.level = lv
 
 
-def _ocr_level(f: np.ndarray, roi) -> int | None:
-    x, y, w, h = roi
-    crop = f[y:y + h, x:x + w]
-    if crop.size == 0:
-        return None
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        big = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-        out = RapidOCR()(big)
-    except Exception:
-        return None
-    if not out or not out[0]:
-        return None
-    for _b, txt, sc in out[0]:
-        d = "".join(ch for ch in txt if ch.isdigit())
-        if d and float(sc) > 0.5 and 1 <= int(d) <= 175:
-            return int(d)
-    return None
+# ---------------------------------------------------------------- 11 等级监控
+class LevelWorker(BaseWorker):
+    name_, hz, gap = "level", 0.05, 0.0      # 20 秒一次
+    LV_ROI = (846, 38, 42, 26)
 
-
-# ---------------------------------------------------------------- 6 主线
-class QuestWorker(BaseWorker):
-    name_, hz = "quest", 1.0
-
-    def __init__(self, cap, ex, stuck_sec: float = 12.0):
+    def __init__(self, cap, ex):
         super().__init__(cap, ex)
-        self.track = _load("quest_track")
-        self.task = _load("task_btn")
-        self.stuck_sec = stuck_sec
-        self.last = time.time()
-        self.count = 0
+        self.level = None
 
     def step(self) -> None:
-        f = self.frame()
+        f = self.frame_bgr()
         if f is None:
             return
-        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-        task = _find(g, self.task, 0.90)
-        if task is None:
-            return                                  # 不在主界面，主线不动作
-        idle = time.time() - self.last
-        if idle < self.stuck_sec:
+        x, y, w, h = self.LV_ROI
+        crop = f[y:y + h, x:x + w]
+        if crop.size == 0:
             return
-        hit = _find(g, self.track, 0.85)
-        if hit:
-            self.ex.push(5, hit[0], hit[1] + 30, "quest:track")
-            self.say(f"卡住 {idle:.0f}s → 点追踪条目标行 ({hit[0]},{hit[1] + 30})")
-        else:
-            self.ex.push(5, task[0], task[1], "quest:open-task")
-            self.say(f"卡住 {idle:.0f}s → 打开任务面板")
-        self.count += 1
-        self.last = time.time()
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            big = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+            out = RapidOCR()(big)
+        except Exception:
+            return
+        if not out or not out[0]:
+            return
+        for _b, txt, sc in out[0]:
+            d = "".join(ch for ch in txt if ch.isdigit())
+            if d and float(sc) > 0.5 and 1 <= int(d) <= 175:
+                if int(d) != self.level:
+                    self.say(f"LV {self.level} -> {int(d)}")
+                    self.level = int(d)
+                return
 
 
 # ---------------------------------------------------------------- 编排
+WORKER_CLASSES = [
+    SkipWorker, CloseWorker, UseWorker, ClaimWorker,
+    BattleAutoWorker, BattleAttackWorker,
+    DialogAutoWorker, DialogOptionWorker,
+    TrackerWorker, HpMpWorker, LevelWorker,
+]
+
+
 @dataclass
 class Fleet:
     cap: Capture
@@ -315,18 +406,10 @@ class Fleet:
     @classmethod
     def start(cls, pid: int, fps: float = 8.0) -> "Fleet":
         dpi_aware()
-        cap = Capture(pid, fps=fps)
-        ex = Executor()
-        hud = HudProbe()
+        cap, ex = Capture(pid, fps=fps), Executor()
+        probes()                                  # 预热模板
         fleet = cls(cap=cap, ex=ex)
-        fleet.workers = [
-            SkipWorker(cap, ex, hud),
-            PanelCloseWorker(cap, ex),
-            PopupUseWorker(cap, ex),
-            BattleWorker(cap, ex),
-            MonitorWorker(cap, ex),
-            QuestWorker(cap, ex),
-        ]
+        fleet.workers = [cls_(cap, ex) for cls_ in WORKER_CLASSES]
         ex.start()
         cap.start()
         for w in fleet.workers:
@@ -350,7 +433,7 @@ if __name__ == "__main__":
                      capture_output=True, text=True, encoding="utf-8",
                      errors="replace").stdout.strip())
     fleet = Fleet.start(pid)
-    print("fleet:", [w.name for w in fleet.workers])
+    print("workers:", [w.name for w in fleet.workers])
     try:
         while True:
             time.sleep(10)

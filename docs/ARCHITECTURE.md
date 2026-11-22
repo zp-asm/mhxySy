@@ -114,3 +114,29 @@ class NpcWorker(BaseWorker):
 3. **战斗策略**：现在只会普攻 + 点第一个目标；需要"用技能/捕捉/逃跑"时得加规则
 4. **追踪条文字变化检测**：小字号 OCR 不稳，目前只用于"有没有变化"，不解析语义
 5. **多实例**：6 个 worker 的模板/ROI 都是单实例基准，多开时每个实例要独立 `Capture` + `Fleet`
+
+---
+
+## 8. 最终线程清单（11 个，单一职责）
+
+| # | 线程 | 频率 | 只做这一件事 | 判据 |
+|---|---|---|---|---|
+| 1 | `skip` | 6 Hz | ▶▶ 跳过过场 | 无 HUD 时；模板或固定坐标 (920,27) |
+| 2 | `close` | 5 Hz | ✕ 关面板 | hero_close2 / hero_close / panel_close* |
+| 3 | `use` | 5 Hz | 点「使用」 | use_btn / popup_use |
+| 4 | `claim` | 5 Hz | 点「领取」 | claim_btn |
+| 5 | `battle_auto` | 2 Hz | 战斗里点「自动」 | btn_attack+btn_skill 同时存在 + battle_auto 模板 |
+| 6 | `battle_atk` | 2 Hz | 无自动按钮时普攻 | 同上，但 auto 模板不命中 |
+| 7 | `dialog_auto` | 3 Hz | 对话点「自动」 | dlg_speaker 命中 + dlg_auto 模板 |
+| 8 | `dialog_opt` | 3 Hz | 对话点选项 | dlg_speaker 命中（无 auto 时点固定位置） |
+| 9 | `tracker` | 0.2 Hz | 点追踪条触发寻路 | task_btn 命中且不在战斗/对话 |
+| 10 | `hpmp` | 1 Hz | 血/蓝条变化 | HSV 色条列投影 |
+| 11 | `level` | 0.05 Hz | 等级角标 OCR | (846,38,42,26) 4 倍放大 |
+
+**共同约束**
+- 全部只经 `Executor` 点屏（优先级 0 中断 / 5 主线），动作排队 >1.5 s 丢弃
+- 任何 worker 抛异常只影响自己（`BaseWorker.run` 捕获）
+- 不解析任务文本；主线只靠"点追踪条 → 游戏自己寻路"
+- `ACTIONS_ENABLED` 默认关，必须 `--enable-actions`
+
+**扩展方式**：新增一个 `class XxxWorker(BaseWorker)`，实现 `step()`，加进 `WORKER_CLASSES` 即可，不改任何既有线程。
